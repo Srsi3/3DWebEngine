@@ -1,0 +1,28 @@
+# Rust build output
+/target/
+
+# Rust/Cargo specific files
+**/*.rs.bk
+Cargo.lock
+
+# Backup files
+*.swp
+*.swo
+*.tmp
+
+# Rust Analyzer extension
+/.rust-analyzer.json
+/.rust-analyzer.jsonc
+
+# VS Code settings (optional, but common)
+.vscode/
+
+# By default, ignore node_modules if using WASM or JS interop
+node_modules/
+
+# Ignore coverage and test output
+/coverage/
+/*.profraw
+
+# Ignore byproducts of cargo tools
+/.cargo/

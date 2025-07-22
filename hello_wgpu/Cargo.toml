@@ -1,0 +1,20 @@
+[package]
+name = "hello_wgpu"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]     # cdylib → JS glue for the browser
+
+[dependencies]
+wgpu  = { version = "26.0.0", features = ["webgl"] } # WebGL2 fallback
+winit = { version = "0.30.11"}
+wasm-bindgen = "0.2"
+pollster = "0.3"          # tiny async executor for native
+cfg-if   = "1.0"
+console_error_panic_hook = { version = "0.1", optional = true }
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Window",
+    "Element",
+]}
