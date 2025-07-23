@@ -1,5 +1,6 @@
 use std::time::{Instant, Duration};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
+use wgpu::StoreOp;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 use winit::application::ApplicationHandler;
@@ -24,7 +25,53 @@ struct Engine {
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,           
     config: wgpu::SurfaceConfiguration,
+    shader: wgpu::ShaderModule,
+    pipeline_layout: wgpu::PipelineLayout,
+    render_pipeline: wgpu::RenderPipeline,
 }
+
+impl Engine {
+    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        let frame = self.surface.get_current_texture()?; // can error
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("Main Encoder") }
+        );
+
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Triangle Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None, // dont know what this does
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            rpass.set_pipeline(&self.render_pipeline);
+            rpass.draw(0..3, 0..1);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+        Ok(())
+    }
+
+    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width == 0 || new_size.height == 0 { return; }
+        self.config.width = new_size.width;
+        self.config.height = new_size.height;
+        self.surface.configure(&self.device, &self.config);
+    }
+}
+
 struct App {
     is_web: bool,
     window: Option<Window>,
@@ -90,13 +137,55 @@ impl App {
         };
         surface.configure(&device, &config);
 
-        self.engine = Some(Engine {
+        
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Triangle Shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("assets/shader.wgsl").into()),
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Pipeline Layout"),
+        bind_group_layouts: &[],
+        push_constant_ranges: &[],
+    });
+
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Render Pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: config.format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None, // not sure what this does, must check docs
+    });
+
+    self.engine = Some(Engine {
             device,
             queue,
             surface, 
             config,
+            shader,
+            pipeline_layout,
+            render_pipeline,
         });
-    }// TODO: create pipelines, upload assets, etc.
+    }
+    
 }
 
 impl ApplicationHandler for App {
@@ -179,6 +268,11 @@ impl ApplicationHandler for App {
                 println!("The close button was pressed; stopping");
                 event_loop.exit();
             },
+            WindowEvent::Resized(size) => {
+                if let Some(engine) = self.engine.as_mut() {
+                    engine.resize(size);
+                }
+            },
             WindowEvent::RedrawRequested => {
                 // Redraw the application.
                 //
@@ -199,11 +293,25 @@ impl ApplicationHandler for App {
 
                     self.finalize_engine();
 
-                    if let Some(engine) = &self.engine {
-                        // TODO: actual rendering:
-                        // let frame = match engine.surface.get_current_texture() { ... }
-                        // encode commands, submit queue, frame.present()
-                        let _ = engine; // silence unused warning for now
+                    if let Some(engine) = self.engine.as_mut() {
+                        match engine.render() {
+                        Ok(()) => {}
+                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                            // Reconfigure on resize/outdated
+                            let size = self.window.as_ref().unwrap().inner_size();
+                            engine.resize(size);
+                        }
+                        Err(wgpu::SurfaceError::Timeout) => {
+                            eprintln!("Surface timeout");
+                        }
+                        Err(wgpu::SurfaceError::OutOfMemory) => {
+                            eprintln!("Out of memory");
+                            event_loop.exit();
+                        }
+                        Err(wgpu::SurfaceError::Other) => {
+                            eprintln!("Unknown surface error");
+                        }
+                    }
                     }
 
                     if let Some(win) = &self.window {
