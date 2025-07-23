@@ -84,14 +84,15 @@ struct App {
     last_frame_time: Instant,  //framelimiter
     engine_ready: Arc<AtomicBool>,
     pending_gpu: Arc<Mutex<Option<(wgpu::Device, wgpu::Queue)>>>,
-    
+    pending_adapter: Arc<Mutex<Option<wgpu::Adapter>>>, 
     instance: Option<wgpu::Instance>,
 }
 
 impl App {
     fn new(is_web: bool) -> Self {
         Self { is_web, window: None, surface: None, adapter: None,engine: None, last_frame_time: Instant::now(),
-             engine_ready: Arc::new(AtomicBool::new(false)), pending_gpu: Arc::new(Mutex::new(None)), instance: None, }
+             engine_ready: Arc::new(AtomicBool::new(false)), pending_gpu: Arc::new(Mutex::new(None)), 
+             pending_adapter: Arc::new(Mutex::new(None)), instance: None, }
     }
     
     async fn build_device_queue(
@@ -125,10 +126,19 @@ impl App {
 
         let mut surface = self.surface.take().expect("surface missing");
 
-        let adapter = self.adapter.as_ref().unwrap();
-
+        let adapter: wgpu::Adapter = if let Some(a) = &self.adapter {
+            a.clone()
+        } else {
+            let mut slot = self.pending_adapter.lock().unwrap();
+            let a = slot
+                .take()
+                .expect("adapter not ready yet (web)");
+            self.adapter = Some(a.clone());   // cache for possible resize calls
+            a
+        };
+        
         let size = self.window.as_ref().unwrap().inner_size();
-        let caps = surface.get_capabilities(adapter);
+        let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
 
         let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
@@ -253,11 +263,12 @@ impl ApplicationHandler for App {
 
         let ready_flag = Arc::clone(&self.engine_ready);  
         let out_slot   = Arc::clone(&self.pending_gpu); 
-        
+        let adapter_slot = Arc::clone(&self.pending_adapter); 
+
         #[cfg(target_arch = "wasm32")]
         {
-            //let surface_handle = self.surface.as_ref().unwrap().clone();        // unchanged
             let backends_copy  = backends;
+
             wasm_bindgen_futures::spawn_local(async move {
                 let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
                 backends: backends_copy,
@@ -272,7 +283,7 @@ impl ApplicationHandler for App {
                     })
                     .await
                     .expect("no adapter");
-
+                { *adapter_slot.lock().unwrap() = Some(adapter.clone()); }
                 App::build_device_queue(adapter, out_slot, ready_flag).await;
             });
         }
