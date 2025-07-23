@@ -84,25 +84,22 @@ struct App {
     last_frame_time: Instant,  //framelimiter
     engine_ready: Arc<AtomicBool>,
     pending_gpu: Arc<Mutex<Option<(wgpu::Device, wgpu::Queue)>>>,
-    pending_adapter: Arc<Mutex<Option<wgpu::Adapter>>>,  
+    
     instance: Option<wgpu::Instance>,
 }
 
 impl App {
     fn new(is_web: bool) -> Self {
         Self { is_web, window: None, surface: None, adapter: None,engine: None, last_frame_time: Instant::now(),
-             engine_ready: Arc::new(AtomicBool::new(false)), pending_gpu: Arc::new(Mutex::new(None)), pending_adapter: Arc::new(Mutex::new(None)), instance: None, }
+             engine_ready: Arc::new(AtomicBool::new(false)), pending_gpu: Arc::new(Mutex::new(None)), instance: None, }
     }
     
     async fn build_device_queue(
         adapter: wgpu::Adapter,
         out_slot: Arc<Mutex<Option<(wgpu::Device, wgpu::Queue)>>>,
-        adapter_slot: Arc<Mutex<Option<wgpu::Adapter>>>,
+        
         ready: Arc<AtomicBool>,) {
-            {
-            let mut a = adapter_slot.lock().unwrap();             // CHANGE
-            *a = Some(adapter.clone());
-        }
+            
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
@@ -121,14 +118,6 @@ impl App {
             return; 
         }
         
-        if self.adapter.is_none() {
-            if let Some(ad) = self.pending_adapter.lock().unwrap().take() { // CHANGE
-                self.adapter = Some(ad);
-            } else {
-                return; // adapter not yet ready
-            }
-        }
-
         let (device, queue) = {
             let mut slot = self.pending_gpu.lock().unwrap();
             slot.take().expect("ready flag set but no device/queue stored")
@@ -262,41 +251,23 @@ impl ApplicationHandler for App {
         let surface: wgpu::Surface<'static> = unsafe { std::mem::transmute(tempsurface) };
         self.surface = Some(surface);
 
-        // let adapter = pollster::block_on(instance_ref.request_adapter(&wgpu::RequestAdapterOptions {
-        //     power_preference: wgpu::PowerPreference::HighPerformance,
-        //     compatible_surface: self.surface.as_ref(),
-        //     force_fallback_adapter: false,
-        // }))
-        // .expect("No compatible adapter found");
-        // self.adapter = Some(adapter.clone());
-
-        //
-        let ready_flag = self.engine_ready.clone();
-        let out_slot = self.pending_gpu.clone();
+        let ready_flag = Arc::clone(&self.engine_ready);  
+        let out_slot   = Arc::clone(&self.pending_gpu); 
         
-        // #[cfg(target_arch = "wasm32")]
-        // {
-        //     wasm_bindgen_futures::spawn_local(async move {
-        //         App::build_device_queue(adapter, out_slot, ready_flag).await;
-        //     });
-        // }
-        // #[cfg(not(target_arch = "wasm32"))]
-        // {
-        //     std::thread::spawn(move || {
-        //         pollster::block_on(async {
-        //             App::build_device_queue(adapter, out_slot, ready_flag).await;
-        //         });
-        //     });
-        // }
         #[cfg(target_arch = "wasm32")]
         {
-            let surface_clone = self.surface.as_ref().unwrap().clone();        
-            let instance_clone = instance_ref.clone();
+            //let surface_handle = self.surface.as_ref().unwrap().clone();        // unchanged
+            let backends_copy  = backends;
             wasm_bindgen_futures::spawn_local(async move {
-                let adapter = instance_clone
+                let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: backends_copy,
+                ..Default::default()
+            });
+
+                let adapter = instance
                     .request_adapter(&wgpu::RequestAdapterOptions {
                         power_preference: wgpu::PowerPreference::HighPerformance,
-                        compatible_surface: Some(&surface_clone),
+                        compatible_surface: None,
                         force_fallback_adapter: false,
                     })
                     .await
