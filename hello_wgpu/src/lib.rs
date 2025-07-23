@@ -1,6 +1,6 @@
 use wasm_bindgen::prelude::*;
-mod hello_wgpu;
-
+pub mod hello_wgpu;
+pub use hello_wgpu::run; 
 cfg_if::cfg_if! {
   if #[cfg(target_arch = "wasm32")] {
       #[wasm_bindgen(start)]

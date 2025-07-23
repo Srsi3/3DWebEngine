@@ -1,0 +1,17 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>3D Web Engine</title>
+
+  <!-- Tell Trunk to build your Rust crate to WASM -->
+  <link data-trunk rel="rust" data-target-name="hello_wgpu" />
+
+  <!-- Optional: serve static assets -->
+  <!-- <link data-trunk rel="copy-dir" href="static" /> -->
+</head>
+<body style="margin:0; overflow:hidden;">
+  <canvas id="wasm-canvas" style="width:100vw; height:100vh; display:block;"></canvas>
+</body>
+</html>
