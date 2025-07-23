@@ -1,11 +1,14 @@
-use std::time::{Instant, Duration};
+use std::time:: Duration;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
+use instant::Instant; 
 use wgpu::StoreOp;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;  
 #[cfg(target_arch = "wasm32")]
 use web_sys::HtmlCanvasElement;
 #[cfg(target_arch = "wasm32")]
@@ -47,8 +50,8 @@ impl Engine {
                     depth_slice: None, // dont know what this does
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: StoreOp::Store,
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r:0.0, g:0.0, b:0.0, a:1.0 }), // opaque black
+                        store: wgpu::StoreOp::Store
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -81,18 +84,25 @@ struct App {
     last_frame_time: Instant,  //framelimiter
     engine_ready: Arc<AtomicBool>,
     pending_gpu: Arc<Mutex<Option<(wgpu::Device, wgpu::Queue)>>>,
+    pending_adapter: Arc<Mutex<Option<wgpu::Adapter>>>,  
+    instance: Option<wgpu::Instance>,
 }
 
 impl App {
     fn new(is_web: bool) -> Self {
-        Self { is_web, window: None, surface: None, adapter: None,engine: None, last_frame_time: Instant::now(), engine_ready: Arc::new(AtomicBool::new(false)), pending_gpu: Arc::new(Mutex::new(None)), }
+        Self { is_web, window: None, surface: None, adapter: None,engine: None, last_frame_time: Instant::now(),
+             engine_ready: Arc::new(AtomicBool::new(false)), pending_gpu: Arc::new(Mutex::new(None)), pending_adapter: Arc::new(Mutex::new(None)), instance: None, }
     }
     
     async fn build_device_queue(
         adapter: wgpu::Adapter,
         out_slot: Arc<Mutex<Option<(wgpu::Device, wgpu::Queue)>>>,
-        ready: Arc<AtomicBool>,
-    ) {
+        adapter_slot: Arc<Mutex<Option<wgpu::Adapter>>>,
+        ready: Arc<AtomicBool>,) {
+            {
+            let mut a = adapter_slot.lock().unwrap();             // CHANGE
+            *a = Some(adapter.clone());
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
@@ -111,6 +121,13 @@ impl App {
             return; 
         }
         
+        if self.adapter.is_none() {
+            if let Some(ad) = self.pending_adapter.lock().unwrap().take() { // CHANGE
+                self.adapter = Some(ad);
+            } else {
+                return; // adapter not yet ready
+            }
+        }
 
         let (device, queue) = {
             let mut slot = self.pending_gpu.lock().unwrap();
@@ -125,6 +142,10 @@ impl App {
         let caps = surface.get_capabilities(adapter);
         let format = caps.formats[0];
 
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque         
+        } else { caps.alpha_modes[0] };
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -133,15 +154,15 @@ impl App {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2, //not sure what this does must check docs
+            desired_maximum_frame_latency: 0, //not sure what this does must check docs
         };
         surface.configure(&device, &config);
 
         
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Triangle Shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("assets/shader.wgsl").into()),
-    });
+            label: Some("Triangle Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("assets/shader.wgsl").into()),
+        });
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Pipeline Layout"),
@@ -175,15 +196,20 @@ impl App {
         cache: None, // not sure what this does, must check docs
     });
 
-    self.engine = Some(Engine {
+    let mut engine = Engine {
             device,
             queue,
-            surface, 
+            surface,
             config,
             shader,
             pipeline_layout,
             render_pipeline,
-        });
+        };
+        engine.resize(size); 
+
+        self.engine = Some(engine);
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&"Engine finalized".into());
     }
     
 }
@@ -199,7 +225,12 @@ impl ApplicationHandler for App {
                 .expect("canvas with id 'wasm-canvas' not found")
                 .dyn_into::<web_sys::HtmlCanvasElement>()
                 .unwrap();
-
+            if canvas.width() == 0 || canvas.height() == 0 {
+                let w = canvas.client_width()  as u32;
+                let h = canvas.client_height() as u32;
+                canvas.set_width(w);
+                canvas.set_height(h);
+            }
            WindowAttributes::default()
                 .with_title("3D Web Engine")
                 .with_canvas(Some(canvas))
@@ -213,7 +244,6 @@ impl ApplicationHandler for App {
         };
     
         let window = event_loop.create_window(window_attributes).unwrap();
-        //let size = window.inner_size();
         self.window = Some(window);
         //
         let backends = if self.is_web {
@@ -224,41 +254,85 @@ impl ApplicationHandler for App {
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
-            ..Default::default()
-        });
+            ..Default::default()});
+        self.instance = Some(instance);
+        let instance_ref = self.instance.as_ref().unwrap();
 
-        let tempsurface = unsafe { instance.create_surface(self.window.as_ref().unwrap()).unwrap() };
+        let tempsurface = unsafe { instance_ref.create_surface(self.window.as_ref().unwrap()).unwrap() };
         let surface: wgpu::Surface<'static> = unsafe { std::mem::transmute(tempsurface) };
         self.surface = Some(surface);
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: self.surface.as_ref(),
-            force_fallback_adapter: false,
-        }))
-        .expect("No compatible adapter found");
-        self.adapter = Some(adapter.clone());
+        // let adapter = pollster::block_on(instance_ref.request_adapter(&wgpu::RequestAdapterOptions {
+        //     power_preference: wgpu::PowerPreference::HighPerformance,
+        //     compatible_surface: self.surface.as_ref(),
+        //     force_fallback_adapter: false,
+        // }))
+        // .expect("No compatible adapter found");
+        // self.adapter = Some(adapter.clone());
 
         //
         let ready_flag = self.engine_ready.clone();
         let out_slot = self.pending_gpu.clone();
         
+        // #[cfg(target_arch = "wasm32")]
+        // {
+        //     wasm_bindgen_futures::spawn_local(async move {
+        //         App::build_device_queue(adapter, out_slot, ready_flag).await;
+        //     });
+        // }
+        // #[cfg(not(target_arch = "wasm32"))]
+        // {
+        //     std::thread::spawn(move || {
+        //         pollster::block_on(async {
+        //             App::build_device_queue(adapter, out_slot, ready_flag).await;
+        //         });
+        //     });
+        // }
         #[cfg(target_arch = "wasm32")]
         {
+            let surface_clone = self.surface.as_ref().unwrap().clone();        
+            let instance_clone = instance_ref.clone();
             wasm_bindgen_futures::spawn_local(async move {
+                let adapter = instance_clone
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: Some(&surface_clone),
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                    .expect("no adapter");
+
                 App::build_device_queue(adapter, out_slot, ready_flag).await;
             });
         }
+
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let adapter = pollster::block_on(instance_ref.request_adapter(
+                &wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: self.surface.as_ref(),
+                    force_fallback_adapter: false,
+                },
+            ))
+            .expect("No compatible adapter found");
+            self.adapter = Some(adapter.clone());
+
             std::thread::spawn(move || {
                 pollster::block_on(async {
                     App::build_device_queue(adapter, out_slot, ready_flag).await;
                 });
             });
         }
+
     }
 
+    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+        // Kick off rendering and ensure continuous redraw on the web too
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         if Some(id) != self.window.as_ref().map(|w| w.id()) {
             return;
@@ -295,22 +369,22 @@ impl ApplicationHandler for App {
 
                     if let Some(engine) = self.engine.as_mut() {
                         match engine.render() {
-                        Ok(()) => {}
-                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                            // Reconfigure on resize/outdated
-                            let size = self.window.as_ref().unwrap().inner_size();
-                            engine.resize(size);
-                        }
-                        Err(wgpu::SurfaceError::Timeout) => {
-                            eprintln!("Surface timeout");
-                        }
-                        Err(wgpu::SurfaceError::OutOfMemory) => {
-                            eprintln!("Out of memory");
-                            event_loop.exit();
-                        }
-                        Err(wgpu::SurfaceError::Other) => {
-                            eprintln!("Unknown surface error");
-                        }
+                            Ok(()) => {}
+                            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                                // Reconfigure on resize/outdated
+                                let size = self.window.as_ref().unwrap().inner_size();
+                                engine.resize(size);
+                            }
+                            Err(wgpu::SurfaceError::Timeout) => {
+                                eprintln!("Surface timeout");
+                            }
+                            Err(wgpu::SurfaceError::OutOfMemory) => {
+                                eprintln!("Out of memory");
+                                event_loop.exit();
+                            }
+                            Err(wgpu::SurfaceError::Other) => {
+                                eprintln!("Unknown surface error");
+                            }
                     }
                     }
 
