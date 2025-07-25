@@ -6,7 +6,7 @@ pub struct Vertex {
 }
 
 impl Vertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float3, 1 => Float4];
+    const ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32, 1 => Float64];
 }
 
 struct Mesh {
@@ -61,19 +61,6 @@ pub fn create_cube(device: &wgpu::Device) -> Mesh {
 }
 
 
-pub fn create_city_block(device: &wgpu::Device, grid_size: usize) -> Vec<Mesh> {
-    let mut meshes = Vec::new();
-
-    for x in 0..grid_size {
-        for z in 0..grid_size {
-            let mesh = create_cube(device);
-            let translation = cgmath::Matrix4::from_translation(cgmath::Vector3::new(x as f32 * 2.0, 0.0, z as f32 * 2.0));
-            meshes.push((mesh, translation));
-        }
-    }
-
-    meshes
-}
 pub fn create_city_block(device: &wgpu::Device, grid_size: usize) -> Vec<Mesh> {
     let mut meshes = Vec::new();
 

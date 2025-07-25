@@ -1,30 +1,46 @@
-struct Camera {
-    position: cgmath::Vector3<f32>,
-    rotation: cgmath::Quaternion<f32>,
-    view_matrix: cgmath::Matrix4<f32>,
-    projection_matrix: cgmath::Matrix4<f32>,
-}
+use cgmath::{Vector3, Quaternion, Deg};
 
+struct Camera {
+    position: Vector3<f32>,
+    rotation: Quaternion<f32>,
+    forward: Vector3<f32>,  // Direction the camera is facing
+    right: Vector3<f32>,    // Right direction (for strafing)
+    up: Vector3<f32>,       // Up direction
+    speed: f32,             // Movement speed
+}
 impl Camera {
     fn new() -> Self {
-        let position = cgmath::Vector3::new(0.0, 5.0, -10.0); // Start behind the city
-        let rotation = cgmath::Quaternion::from_angle_x(cgmath::Deg(0.0));
-        let view_matrix = cgmath::Matrix4::look_at_rh(position, cgmath::Vector3::zero(), cgmath::Vector3::unit_y());
-        let projection_matrix = cgmath::perspective(cgmath::Deg(45.0), 16.0/9.0, 0.1, 100.0);
-
         Camera {
-            position,
-            rotation,
-            view_matrix,
-            projection_matrix,
+            position: Vector3::new(0.0, 5.0, -10.0),
+            rotation: Quaternion::from_angle_y(Deg(0.0)),
+            forward: Vector3::new(0.0, 0.0, 1.0),
+            right: Vector3::new(1.0, 0.0, 0.0),
+            up: Vector3::new(0.0, 1.0, 0.0),
+            speed: 5.0,
         }
     }
 
-    fn update(&mut self, delta_time: f32) {
-        // Move the camera with keyboard inputs (W, A, S, D)
-        // Update `position` and `view_matrix` based on input
+    fn update(&mut self, delta_time: f32, input: &KeyboardInput) {
+        let movement_speed = self.speed * delta_time;
+
+        if input.is_key_pressed(VirtualKeyCode::W) {
+            self.position += self.forward * movement_speed;
+        }
+        if input.is_key_pressed(VirtualKeyCode::S) {
+            self.position -= self.forward * movement_speed;
+        }
+        if input.is_key_pressed(VirtualKeyCode::A) {
+            self.position -= self.right * movement_speed;
+        }
+        if input.is_key_pressed(VirtualKeyCode::D) {
+            self.position += self.right * movement_speed;
+        }
     }
 
+    fn get_view_matrix(&self) -> cgmath::Matrix4<f32> {
+        cgmath::Matrix4::look_at_rh(self.position, self.position + self.forward, self.up)
+    }
+    
     fn get_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
         self.projection_matrix * self.view_matrix
     }
@@ -68,16 +84,16 @@ fn render(&mut self, meshes: &Vec<(Mesh, cgmath::Matrix4<f32>)>, camera: &Camera
 fn should_render(building_position: cgmath::Vector3<f32>, camera_position: cgmath::Vector3<f32>, max_distance: f32) -> bool {
     (building_position - camera_position).magnitude() < max_distance
 }
-//copilot generated code to render visible buildings based on distance from camera -- not sure if this is the best way to do it
-fn render_visible_buildings(&mut self, meshes: &Vec<(Mesh, cgmath::Matrix4<f32>)>, camera: &Camera) {
-    let max_distance = 50.0; // Adjust based on your needs
-    let camera_position = camera.position;
+// //copilot generated code to render visible buildings based on distance from camera -- not sure if this is the best way to do it
+// fn render_visible_buildings(&mut self, meshes: &Vec<(Mesh, cgmath::Matrix4<f32>)>, camera: &Camera) {
+//     let max_distance = 50.0; // Adjust based on your needs
+//     let camera_position = camera.position;
 
-    for (mesh, translation) in meshes {
-        let building_position = translation.w.truncate(); // Extract position from the translation matrix
+//     for (mesh, translation) in meshes {
+//         let building_position = translation.w.truncate(); // Extract position from the translation matrix
 
-        if should_render(building_position, camera_position, max_distance) {
-            self.render(mesh, translation);
-        }
-    }
-}
+//         if should_render(building_position, camera_position, max_distance) {
+//             self.render(mesh, translation);
+//         }
+//     }
+// }
