@@ -2,8 +2,10 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
 use std::time::Duration;
 
 use bytemuck::{Pod, Zeroable};
-// SquareMatrix gives Matrix4::identity()
-use cgmath::{Matrix4, SquareMatrix, Vector3, EuclideanSpace, InnerSpace};
+use cgmath::{
+    Matrix4, SquareMatrix, Vector3,
+    EuclideanSpace, InnerSpace, // <- needed for to_vec(), magnitude(), dot()
+};
 use instant::Instant;
 use log::{trace, debug, info, warn, error};
 use wgpu::util::DeviceExt;
@@ -12,7 +14,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 #[cfg(target_arch = "wasm32")]
@@ -37,10 +39,18 @@ struct CameraUniform {
 }
 
 #[derive(Copy, Clone)]
+enum MeshKind {
+    Lowrise,  // block_lowrise
+    Highrise, // tower_highrise
+    Pyramid,  // pyramid_tower
+}
+
+#[derive(Copy, Clone)]
 struct WorldInstanceCPU {
-    model: Matrix4<f32>,
+    model:  Matrix4<f32>,
     center: Vector3<f32>,
-    half: Vector3<f32>,
+    half:   Vector3<f32>,
+    kind:   MeshKind,
 }
 
 // Pad the uniform buffer allocation to 256 bytes for maximum backend compatibility.
@@ -99,6 +109,8 @@ pub async fn run(is_web: bool) {
     }
 }
 
+// -------------------- ENGINE --------------------
+
 struct Engine {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -117,39 +129,79 @@ struct Engine {
     camera_bg:  wgpu::BindGroup,
     camera_buf: wgpu::Buffer,
 
-    // Mesh and instances
-    cube_mesh:      mesh::Mesh,
-    instance_buf:   wgpu::Buffer,
-    instance_count: u32,
+    // Meshes
+    mesh_lowrise:   mesh::Mesh, // near/mid
+    mesh_highrise:  mesh::Mesh, // near/mid
+    mesh_pyramid:   mesh::Mesh, // near/mid
+    mesh_billboard: mesh::Mesh, // far
+
+    // Instance buffers (per LOD + per mesh where needed)
+    // LOD0 (near)
+    instbuf_lod0_lowrise:  wgpu::Buffer,
+    instbuf_lod0_highrise: wgpu::Buffer,
+    instbuf_lod0_pyramid:  wgpu::Buffer,
+    cnt_lod0_lowrise:  u32,
+    cnt_lod0_highrise: u32,
+    cnt_lod0_pyramid:  u32,
+
+    // LOD1 (mid)
+    instbuf_lod1_lowrise:  wgpu::Buffer,
+    instbuf_lod1_highrise: wgpu::Buffer,
+    instbuf_lod1_pyramid:  wgpu::Buffer,
+    cnt_lod1_lowrise:  u32,
+    cnt_lod1_highrise: u32,
+    cnt_lod1_pyramid:  u32,
+
+    // LOD2 (far) -> billboard for every kind
+    instbuf_lod2_billboard: wgpu::Buffer,
+    cnt_lod2_billboard: u32,
 }
 
 impl Engine {
     fn update_camera(&self, vp: &Matrix4<f32>) {
-        trace!("update_camera: uploading VP matrix");
         let data = CameraUniform { view_proj: mat4_to_array(vp) };
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&data));
     }
 
-    // NEW: allow per-frame compaction of visible instances
-    fn update_instances(&mut self, visible: &[InstanceRaw]) {
-        let bytes = bytemuck::cast_slice(visible);
-        if !bytes.is_empty() {
-            self.queue.write_buffer(&self.instance_buf, 0, bytes);
-        }
-        self.instance_count = visible.len() as u32;
+    fn update_instances(
+        &mut self,
+        // LOD0
+        v0_low: &[InstanceRaw],
+        v0_high: &[InstanceRaw],
+        v0_pyr: &[InstanceRaw],
+        // LOD1
+        v1_low: &[InstanceRaw],
+        v1_high: &[InstanceRaw],
+        v1_pyr: &[InstanceRaw],
+        // LOD2
+        v2_bill: &[InstanceRaw],
+    ) {
+        if !v0_low.is_empty()  { self.queue.write_buffer(&self.instbuf_lod0_lowrise,  0, bytemuck::cast_slice(v0_low)); }
+        if !v0_high.is_empty() { self.queue.write_buffer(&self.instbuf_lod0_highrise, 0, bytemuck::cast_slice(v0_high)); }
+        if !v0_pyr.is_empty()  { self.queue.write_buffer(&self.instbuf_lod0_pyramid,  0, bytemuck::cast_slice(v0_pyr)); }
+        if !v1_low.is_empty()  { self.queue.write_buffer(&self.instbuf_lod1_lowrise,  0, bytemuck::cast_slice(v1_low)); }
+        if !v1_high.is_empty() { self.queue.write_buffer(&self.instbuf_lod1_highrise, 0, bytemuck::cast_slice(v1_high)); }
+        if !v1_pyr.is_empty()  { self.queue.write_buffer(&self.instbuf_lod1_pyramid,  0, bytemuck::cast_slice(v1_pyr)); }
+        if !v2_bill.is_empty() { self.queue.write_buffer(&self.instbuf_lod2_billboard,0, bytemuck::cast_slice(v2_bill)); }
+
+        self.cnt_lod0_lowrise  = v0_low.len()  as u32;
+        self.cnt_lod0_highrise = v0_high.len() as u32;
+        self.cnt_lod0_pyramid  = v0_pyr.len()  as u32;
+
+        self.cnt_lod1_lowrise  = v1_low.len()  as u32;
+        self.cnt_lod1_highrise = v1_high.len() as u32;
+        self.cnt_lod1_pyramid  = v1_pyr.len()  as u32;
+
+        self.cnt_lod2_billboard = v2_bill.len() as u32;
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        trace!("render: acquiring current texture");
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        trace!("render: creating command encoder");
         let mut encoder = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("Main Encoder") }
         );
 
-        trace!("render: begin render pass");
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Render Pass"),
@@ -158,14 +210,14 @@ impl Engine {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.02, a: 1.0 }),
+                        load:  wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.02, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load:  wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -176,20 +228,62 @@ impl Engine {
 
             rpass.set_pipeline(&self.render_pipeline);
             rpass.set_bind_group(0, &self.camera_bg, &[]);
-            rpass.set_vertex_buffer(0, self.cube_mesh.vertex_buffer.slice(..));
-            rpass.set_vertex_buffer(1, self.instance_buf.slice(..));
-            rpass.set_index_buffer(self.cube_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            rpass.draw_indexed(0..self.cube_mesh.index_count, 0, 0..self.instance_count);
+
+            // ---- LOD0 NEAR ----
+            if self.cnt_lod0_lowrise > 0 {
+                rpass.set_vertex_buffer(0, self.mesh_lowrise.vertex_buffer.slice(..));
+                rpass.set_index_buffer(self.mesh_lowrise.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.set_vertex_buffer(1, self.instbuf_lod0_lowrise.slice(..));
+                rpass.draw_indexed(0..self.mesh_lowrise.index_count, 0, 0..self.cnt_lod0_lowrise);
+            }
+            if self.cnt_lod0_highrise > 0 {
+                rpass.set_vertex_buffer(0, self.mesh_highrise.vertex_buffer.slice(..));
+                rpass.set_index_buffer(self.mesh_highrise.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.set_vertex_buffer(1, self.instbuf_lod0_highrise.slice(..));
+                rpass.draw_indexed(0..self.mesh_highrise.index_count, 0, 0..self.cnt_lod0_highrise);
+            }
+            if self.cnt_lod0_pyramid > 0 {
+                rpass.set_vertex_buffer(0, self.mesh_pyramid.vertex_buffer.slice(..));
+                rpass.set_index_buffer(self.mesh_pyramid.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.set_vertex_buffer(1, self.instbuf_lod0_pyramid.slice(..));
+                rpass.draw_indexed(0..self.mesh_pyramid.index_count, 0, 0..self.cnt_lod0_pyramid);
+            }
+
+            // ---- LOD1 MID ----
+            if self.cnt_lod1_lowrise > 0 {
+                rpass.set_vertex_buffer(0, self.mesh_lowrise.vertex_buffer.slice(..));
+                rpass.set_index_buffer(self.mesh_lowrise.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.set_vertex_buffer(1, self.instbuf_lod1_lowrise.slice(..));
+                rpass.draw_indexed(0..self.mesh_lowrise.index_count, 0, 0..self.cnt_lod1_lowrise);
+            }
+            if self.cnt_lod1_highrise > 0 {
+                rpass.set_vertex_buffer(0, self.mesh_highrise.vertex_buffer.slice(..));
+                rpass.set_index_buffer(self.mesh_highrise.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.set_vertex_buffer(1, self.instbuf_lod1_highrise.slice(..));
+                rpass.draw_indexed(0..self.mesh_highrise.index_count, 0, 0..self.cnt_lod1_highrise);
+            }
+            if self.cnt_lod1_pyramid > 0 {
+                rpass.set_vertex_buffer(0, self.mesh_pyramid.vertex_buffer.slice(..));
+                rpass.set_index_buffer(self.mesh_pyramid.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.set_vertex_buffer(1, self.instbuf_lod1_pyramid.slice(..));
+                rpass.draw_indexed(0..self.mesh_pyramid.index_count, 0, 0..self.cnt_lod1_pyramid);
+            }
+
+            // ---- LOD2 FAR (billboards) ----
+            if self.cnt_lod2_billboard > 0 {
+                rpass.set_vertex_buffer(0, self.mesh_billboard.vertex_buffer.slice(..));
+                rpass.set_index_buffer(self.mesh_billboard.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.set_vertex_buffer(1, self.instbuf_lod2_billboard.slice(..));
+                rpass.draw_indexed(0..self.mesh_billboard.index_count, 0, 0..self.cnt_lod2_billboard);
+            }
         }
 
-        trace!("render: submitting queue");
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
     }
 
     fn recreate_depth(&mut self, width: u32, height: u32) {
-        info!("recreate_depth: {}x{}", width, height);
         let desc = wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -206,16 +300,16 @@ impl Engine {
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width == 0 || new_size.height == 0 {
-            warn!("resize: skipped (zero dimension) {}x{}", new_size.width, new_size.height);
             return;
         }
-        info!("resize: {}x{}", new_size.width, new_size.height);
         self.config.width = new_size.width;
         self.config.height = new_size.height;
         self.surface.configure(&self.device, &self.config);
         self.recreate_depth(new_size.width, new_size.height);
     }
 }
+
+// -------------------- APP --------------------
 
 struct App {
     is_web: bool,
@@ -240,11 +334,13 @@ struct App {
 
     // CPU-side instances for culling/LOD
     cpu_instances: Vec<WorldInstanceCPU>,
+
+    // Track how far we've shifted the world (global origin), optional for future use
+    world_origin: cgmath::Vector3<f64>,
 }
 
 impl App {
     fn new(is_web: bool) -> Self {
-        info!("App::new(is_web={})", is_web);
         Self {
             is_web,
             window: None,
@@ -260,6 +356,7 @@ impl App {
             pending_adapter: Arc::new(Mutex::new(None)),
             instance: None,
             cpu_instances: Vec::new(),
+            world_origin: cgmath::Vector3::new(0.0, 0.0, 0.0),
         }
     }
 
@@ -268,7 +365,6 @@ impl App {
         out_slot: Arc<Mutex<Option<(wgpu::Device, wgpu::Queue)>>>,
         ready: Arc<AtomicBool>,
     ) {
-        info!("build_device_queue: requesting device from adapter");
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
@@ -283,7 +379,6 @@ impl App {
             *slot = Some((device, queue));
         }
         ready.store(true, Ordering::SeqCst);
-        info!("build_device_queue: device/queue ready")
     }
 
     fn instance_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
@@ -300,19 +395,10 @@ impl App {
     }
 
     fn finalize_engine(&mut self) {
-        // These traces help confirm finalize timing:
-        trace!("finalize_engine: called, ready_flag={}", self.engine_ready.load(Ordering::SeqCst));
-
-        if self.engine.is_some() {
-            trace!("finalize_engine: already created");
-            return;
-        }
-        if !self.engine_ready.load(Ordering::SeqCst) {
-            trace!("finalize_engine: not ready yet");
+        if self.engine.is_some() || !self.engine_ready.load(Ordering::SeqCst) {
             return;
         }
 
-        info!("finalize_engine: starting");
         let (device, queue) = {
             let mut slot = self.pending_gpu.lock().unwrap();
             slot.take().expect("ready flag set but no device/queue stored")
@@ -329,21 +415,14 @@ impl App {
             a
         };
 
-        let info = adapter.get_info();
-        info!("Adapter: name='{}', backend={:?}", info.name, info.backend);
-
         let size = self.window.as_ref().unwrap().inner_size();
         let caps = surface.get_capabilities(&adapter);
-        debug!("Surface caps: formats={:?}, present_modes={:?}, alpha_modes={:?}",
-            caps.formats, caps.present_modes, caps.alpha_modes);
-
         let format = caps.formats[0];
         let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
             wgpu::CompositeAlphaMode::Opaque
         } else {
             caps.alpha_modes[0]
         };
-        info!("Chosen surface format={:?}, alpha={:?}", format, alpha_mode);
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -356,9 +435,8 @@ impl App {
             desired_maximum_frame_latency: 0,
         };
         surface.configure(&device, &config);
-        info!("Surface configured: {}x{}", size.width, size.height);
 
-        // --- Depth setup ---
+        // --- Depth
         let depth_format = wgpu::TextureFormat::Depth24Plus;
         let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
@@ -371,16 +449,14 @@ impl App {
             view_formats: &[],
         });
         let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        info!("Depth texture created ({:?})", depth_format);
 
-        // --- Shader ---
+        // --- Shader
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Main Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("assets/shader.wgsl").into()),
         });
-        info!("Shader module created");
 
-        // --- Camera BGL/BG/Buffer (group=0, binding=0) ---
+        // --- Camera uniform
         let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Camera BGL"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -389,7 +465,7 @@ impl App {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(64), // mat4x4<f32>
+                    min_binding_size: wgpu::BufferSize::new(64),
                 },
                 count: None,
             }],
@@ -408,16 +484,14 @@ impl App {
                 resource: camera_buf.as_entire_binding(),
             }],
         });
-        info!("Camera uniform created (buffer {} bytes)", CAMERA_BUFFER_SIZE);
 
-        // --- Pipeline layout (use camera group at index 0) ---
+        // --- Pipeline
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
             bind_group_layouts: &[&camera_bgl],
             push_constant_ranges: &[],
         });
 
-        // --- Pipeline (vertex buffers: mesh + instance) ---
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&pipeline_layout),
@@ -449,35 +523,83 @@ impl App {
             multiview: None,
             cache: None,
         });
-        info!("Render pipeline created");
 
-        // --- Mesh & instances ---
-        let cube_mesh = mesh::create_cube(&device);
-        info!("Cube mesh buffers ready (indices: {})", cube_mesh.index_count);
+        // --- Meshes (variety)
+        let mesh_lowrise   = mesh::create_block_lowrise(&device);
+        let mesh_highrise  = mesh::create_tower_highrise(&device);
+        let mesh_pyramid   = mesh::create_pyramid_tower(&device);
+        let mesh_billboard = mesh::create_billboard_quad(&device);
 
-        // NEW: Build CPU + GPU instance data together
-        // Increase grid: culling will keep it fast.
+        // --- CPU instances with mesh variety
         let grid = 64usize;
         let mut cpu_instances = Vec::with_capacity(grid * grid);
-        let mut instance_data = Vec::with_capacity(grid * grid);
-        let half = Vector3::new(0.5, 0.5, 0.5); // cube half-extents
 
-        for x in 0..grid {
-            for z in 0..grid {
-                let pos = Vector3::new((x as f32) * 2.5, 0.0, (z as f32) * 2.5);
-                let model = Matrix4::<f32>::from_translation(pos);
-                cpu_instances.push(WorldInstanceCPU { model, center: pos, half });
-                instance_data.push(InstanceRaw { model: mat4_to_array(&model) });
+        // half-extents per kind (approx for culling)
+        let half_lowrise  = Vector3::new(1.5, 0.4, 1.0);  // 3.0 x 0.8 x 2.0
+        let half_highrise = Vector3::new(0.45, 3.0, 0.45); // 0.9 x 6.0 x 0.9
+        let half_pyramid  = Vector3::new(1.0, 1.1, 1.0);   // base(1.0) + roof apex
+
+        // simple deterministic "random" from grid coords
+        fn pick_kind(x: u32, z: u32) -> MeshKind {
+            let mut h = x ^ (z << 16) ^ 0x9E3779B9;
+            h = h.wrapping_mul(0x85EBCA6B);
+            let r = (h % 100) as u32;
+            match r {
+                0..=39  => MeshKind::Lowrise,   // 40%
+                40..=79 => MeshKind::Highrise,  // 40%
+                _       => MeshKind::Pyramid,   // 20%
             }
         }
 
-        let instance_count = instance_data.len() as u32;
-        let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Instance Buffer"),
-            contents: bytemuck::cast_slice(&instance_data),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
-        info!("Instance buffer created ({} instances)", instance_count);
+        for x in 0..grid {
+            for z in 0..grid {
+                let pos = Vector3::new((x as f32) * 4.0, 0.0, (z as f32) * 4.0);
+                let kind = pick_kind(x as u32, z as u32);
+                let half = match kind {
+                    MeshKind::Lowrise  => half_lowrise,
+                    MeshKind::Highrise => half_highrise,
+                    MeshKind::Pyramid  => half_pyramid,
+                };
+                let model = Matrix4::<f32>::from_translation(pos);
+                cpu_instances.push(WorldInstanceCPU { model, center: pos, half, kind });
+            }
+        }
+        info!("CPU instances created: {}", cpu_instances.len());
+
+        // Count per kind (to size instance buffers)
+        let mut count_low = 0usize;
+        let mut count_high = 0usize;
+        let mut count_pyr = 0usize;
+        for inst in &cpu_instances {
+            match inst.kind {
+                MeshKind::Lowrise  => count_low += 1,
+                MeshKind::Highrise => count_high += 1,
+                MeshKind::Pyramid  => count_pyr += 1,
+            }
+        }
+        let stride = std::mem::size_of::<InstanceRaw>() as u64;
+
+        // helper to create buffer sized for n instances
+        let make_buf = |label: &str, n: usize| -> wgpu::Buffer {
+            let size = (n.max(1) as u64) * stride;
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+
+        // LOD0 buffers per kind
+        let instbuf_lod0_lowrise  = make_buf("instbuf_lod0_lowrise",  count_low);
+        let instbuf_lod0_highrise = make_buf("instbuf_lod0_highrise", count_high);
+        let instbuf_lod0_pyramid  = make_buf("instbuf_lod0_pyramid",  count_pyr);
+        // LOD1 buffers per kind
+        let instbuf_lod1_lowrise  = make_buf("instbuf_lod1_lowrise",  count_low);
+        let instbuf_lod1_highrise = make_buf("instbuf_lod1_highrise", count_high);
+        let instbuf_lod1_pyramid  = make_buf("instbuf_lod1_pyramid",  count_pyr);
+        // LOD2 billboard buffer (one for all)
+        let instbuf_lod2_billboard = make_buf("instbuf_lod2_billboard", cpu_instances.len());
 
         let mut engine = Engine {
             device,
@@ -492,24 +614,57 @@ impl App {
             camera_bgl,
             camera_bg,
             camera_buf,
-            cube_mesh,
-            instance_buf,
-            instance_count,
+            mesh_lowrise,
+            mesh_highrise,
+            mesh_pyramid,
+            mesh_billboard,
+            instbuf_lod0_lowrise,
+            instbuf_lod0_highrise,
+            instbuf_lod0_pyramid,
+            cnt_lod0_lowrise: 0,
+            cnt_lod0_highrise: 0,
+            cnt_lod0_pyramid: 0,
+            instbuf_lod1_lowrise,
+            instbuf_lod1_highrise,
+            instbuf_lod1_pyramid,
+            cnt_lod1_lowrise: 0,
+            cnt_lod1_highrise: 0,
+            cnt_lod1_pyramid: 0,
+            instbuf_lod2_billboard,
+            cnt_lod2_billboard: 0,
         };
         engine.resize(size);
 
         self.engine = Some(engine);
-
-        // NEW: store CPU copies for culling/LOD
         self.cpu_instances = cpu_instances;
+    }
 
-        info!("finalize_engine: done");
+    // ---------------- Floating Origin ----------------
+
+    const ORIGIN_SHIFT_DISTANCE: f32 = 500.0;
+
+    fn maybe_shift_origin(&mut self) {
+        let cam_pos = self.camera.position.to_vec();
+        if cam_pos.magnitude() > Self::ORIGIN_SHIFT_DISTANCE {
+            self.shift_world(cam_pos);
+        }
+    }
+
+    fn shift_world(&mut self, offset: Vector3<f32>) {
+        info!("Floating origin shift by ({:.1}, {:.1}, {:.1})", offset.x, offset.y, offset.z);
+
+        for inst in &mut self.cpu_instances {
+            inst.center -= offset;
+            inst.model = Matrix4::<f32>::from_translation(inst.center);
+        }
+
+        self.camera.position -= offset;
+        self.world_origin += cgmath::Vector3::new(offset.x as f64, offset.y as f64, offset.z as f64);
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        info!("Application resumed");
         let window_attributes = if self.is_web {
             #[cfg(target_arch = "wasm32")]
             {
@@ -524,7 +679,6 @@ impl ApplicationHandler for App {
                     let h = canvas.client_height() as u32;
                     canvas.set_width(w);
                     canvas.set_height(h);
-                    info!("Canvas size initialized to {}x{}", w, h);
                 }
                 WindowAttributes::default()
                     .with_title("3D Web Engine")
@@ -539,7 +693,6 @@ impl ApplicationHandler for App {
         };
 
         let window = event_loop.create_window(window_attributes).unwrap();
-        info!("Window created");
         self.window = Some(window);
 
         let backends = if self.is_web {
@@ -547,7 +700,6 @@ impl ApplicationHandler for App {
         } else {
             wgpu::Backends::all()
         };
-        info!("Using backends: {:?}", backends);
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
@@ -561,7 +713,6 @@ impl ApplicationHandler for App {
         };
         let surface: wgpu::Surface<'static> = unsafe { std::mem::transmute(tempsurface) };
         self.surface = Some(surface);
-        info!("Surface created");
 
         let ready_flag = Arc::clone(&self.engine_ready);
         let out_slot   = Arc::clone(&self.pending_gpu);
@@ -570,8 +721,6 @@ impl ApplicationHandler for App {
         #[cfg(target_arch = "wasm32")]
         {
             let backends_copy  = backends;
-
-            info!("Requesting adapter (web)");
             wasm_bindgen_futures::spawn_local(async move {
                 let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
                     backends: backends_copy,
@@ -594,7 +743,6 @@ impl ApplicationHandler for App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            info!("Requesting adapter (native)");
             let adapter = pollster::block_on(instance_ref.request_adapter(
                 &wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
@@ -603,11 +751,9 @@ impl ApplicationHandler for App {
                 },
             ))
             .expect("No compatible adapter found");
-            info!("Adapter acquired (native)");
             self.adapter = Some(adapter.clone());
 
             std::thread::spawn(move || {
-                info!("Spawning device/queue creation thread");
                 pollster::block_on(async {
                     App::build_device_queue(adapter, out_slot, ready_flag).await;
                 });
@@ -616,7 +762,6 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
-        // Keep asking for redraws — this drives the render loop.
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -628,20 +773,13 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => {
-                info!("Close requested; exiting");
                 event_loop.exit();
             },
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match event.state {
-                        ElementState::Pressed => {
-                            trace!("key down: {:?}", code);
-                            self.keyboard_input.key_press(code)
-                        }
-                        ElementState::Released => {
-                            trace!("key up: {:?}", code);
-                            self.keyboard_input.key_release(code)
-                        }
+                        ElementState::Pressed => self.keyboard_input.key_press(code),
+                        ElementState::Released => self.keyboard_input.key_release(code),
                     }
                 }
             }
@@ -655,53 +793,81 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Resized(size) => {
-                info!("Window resized: {}x{}", size.width, size.height);
                 if let Some(engine) = self.engine.as_mut() {
                     engine.resize(size);
                 }
             },
             WindowEvent::RedrawRequested => {
-                trace!("RedrawRequested");
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_frame_time).as_secs_f32();
-                if dt >= 0.016 { // ~60 FPS limiter
+                if dt >= 0.016 {
                     self.camera.update(dt, &self.keyboard_input);
-                    self.last_frame_time = now;
 
+                    // Floating origin before culling/draw
+                    self.maybe_shift_origin();
+
+                    self.last_frame_time = now;
                     self.finalize_engine();
 
                     if let Some(engine) = self.engine.as_mut() {
-                        // Compute VP and upload to the uniform
+                        // Compute VP and upload
                         let size = self.window.as_ref().unwrap().inner_size();
                         let aspect = (size.width.max(1) as f32) / (size.height.max(1) as f32);
                         let vp = self.camera.view_projection(aspect);
                         engine.update_camera(&vp);
 
-                        // NEW: CPU culling + simple distance LOD
-                        // Tune as desired:
-                        const LOD0_MAX: f32 = 120.0;  // draw up to 120 m
-                        const CULL_MAX: f32 = 300.0;  // never draw beyond 300 m
+                        // --------- CULL + LOD ----------
+                        const LOD0_MAX: f32 = 80.0;   // near
+                        const LOD1_MAX: f32 = 180.0;  // mid
+                        const CULL_MAX: f32 = 350.0;  // far cutoff
 
                         let fr = culling::frustum_from_vp(&vp);
                         let cam_pos = self.camera.position.to_vec();
 
-                        let mut visible: Vec<InstanceRaw> = Vec::with_capacity(self.cpu_instances.len());
+                        // Visible lists
+                        let mut v0_low: Vec<InstanceRaw>  = Vec::with_capacity(1024);
+                        let mut v0_high: Vec<InstanceRaw> = Vec::with_capacity(1024);
+                        let mut v0_pyr: Vec<InstanceRaw>  = Vec::with_capacity(1024);
+
+                        let mut v1_low: Vec<InstanceRaw>  = Vec::with_capacity(2048);
+                        let mut v1_high: Vec<InstanceRaw> = Vec::with_capacity(2048);
+                        let mut v1_pyr: Vec<InstanceRaw>  = Vec::with_capacity(2048);
+
+                        let mut v2_bill: Vec<InstanceRaw> = Vec::with_capacity(4096);
+
                         for inst in &self.cpu_instances {
                             let dist = (inst.center - cam_pos).magnitude();
                             if dist > CULL_MAX { continue; }
-                            if dist > LOD0_MAX { continue; }        // simple LOD: skip mid/far for now
                             if !culling::aabb_intersects_frustum(inst.center, inst.half, &fr) { continue; }
 
-                            visible.push(InstanceRaw { model: mat4_to_array(&inst.model) });
+                            let raw = InstanceRaw { model: mat4_to_array(&inst.model) };
+                            if dist <= LOD0_MAX {
+                                match inst.kind {
+                                    MeshKind::Lowrise  => v0_low.push(raw),
+                                    MeshKind::Highrise => v0_high.push(raw),
+                                    MeshKind::Pyramid  => v0_pyr.push(raw),
+                                }
+                            } else if dist <= LOD1_MAX {
+                                match inst.kind {
+                                    MeshKind::Lowrise  => v1_low.push(raw),
+                                    MeshKind::Highrise => v1_high.push(raw),
+                                    MeshKind::Pyramid  => v1_pyr.push(raw),
+                                }
+                            } else {
+                                v2_bill.push(raw);
+                            }
                         }
 
-                        engine.update_instances(&visible);
-                        trace!("CULL: visible={} / total={}", visible.len(), self.cpu_instances.len());
+                        engine.update_instances(
+                            &v0_low, &v0_high, &v0_pyr,
+                            &v1_low, &v1_high, &v1_pyr,
+                            &v2_bill,
+                        );
 
+                        // Render
                         match engine.render() {
                             Ok(()) => {}
                             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                                warn!("Surface lost/outdated; reconfiguring");
                                 let size = self.window.as_ref().unwrap().inner_size();
                                 engine.resize(size);
                             }
@@ -716,8 +882,6 @@ impl ApplicationHandler for App {
                                 error!("Unknown surface error");
                             }
                         }
-                    } else {
-                        trace!("RedrawRequested: engine not ready yet");
                     }
 
                     if let Some(win) = &self.window {
@@ -725,7 +889,7 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            _ => {} // << keep the catch‑all ONLY here, at the end
+            _ => {}
         }
     }
 }
