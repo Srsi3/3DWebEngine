@@ -36,4 +36,5 @@ console-panic-hook = ["console_error_panic_hook"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
-
+console_log = "1"
+console_error_panic_hook = "0.1"

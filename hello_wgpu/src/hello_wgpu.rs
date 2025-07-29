@@ -261,7 +261,7 @@ impl App {
             *slot = Some((device, queue));
         }
         ready.store(true, Ordering::SeqCst);
-        info!("build_device_queue: device/queue ready");
+        info!("build_device_queue: device/queue ready")
     }
 
     fn instance_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
@@ -549,23 +549,17 @@ impl ApplicationHandler for App {
                     ..Default::default()
                 });
 
-                match instance
+                let adapter = instance
                     .request_adapter(&wgpu::RequestAdapterOptions {
                         power_preference: wgpu::PowerPreference::HighPerformance,
                         compatible_surface: None,
                         force_fallback_adapter: false,
                     })
                     .await
-                {
-                    Some(adapter) => {
-                        info!("Adapter acquired (web)");
-                        { *adapter_slot.lock().unwrap() = Some(adapter.clone()); }
-                        App::build_device_queue(adapter, out_slot, ready_flag).await;
-                    }
-                    None => {
-                        error!("No adapter available (web)");
-                    }
-                }
+                    .expect("request_adapter failed on web");
+
+                { *adapter_slot.lock().unwrap() = Some(adapter.clone()); }
+                App::build_device_queue(adapter, out_slot, ready_flag).await;
             });
         }
 
