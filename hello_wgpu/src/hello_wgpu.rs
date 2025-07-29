@@ -4,12 +4,11 @@ use std::time::Duration;
 use bytemuck::{Pod, Zeroable};
 use cgmath::{
     Matrix4, SquareMatrix, Vector3,
-    EuclideanSpace, InnerSpace, // <- needed for to_vec(), magnitude(), dot()
+    EuclideanSpace, InnerSpace, // to_vec(), magnitude(), dot()
 };
 use instant::Instant;
 use log::{trace, debug, info, warn, error};
 use wgpu::util::DeviceExt;
-use wgpu::StoreOp;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, WindowEvent};
@@ -27,8 +26,54 @@ use web_sys::HtmlCanvasElement;
 use winit::platform::web::WindowAttributesExtWebSys;
 
 use crate::camera;
-use crate::mesh;
 use crate::culling;
+use crate::mesh;
+
+fn init_logging(is_web: bool) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Logs go to the browser console.
+        let _ = console_log::init_with_level(log::Level::Info);
+
+        // Optional panic hook if you enabled the feature (won’t compile unless the feature is on)
+        #[cfg(feature = "console-panic-hook")]
+        console_error_panic_hook::set_once();
+
+        // A quick visible marker in the console
+        web_sys::console::log_1(&"Logging initialized (WASM)".into());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Logs go to stderr and honor RUST_LOG
+        use env_logger::{Builder, Env};
+        let env = Env::default().filter_or(
+            "RUST_LOG",
+            // Default if RUST_LOG not set:
+            "hello_wgpu=trace,wgpu_core=warn,wgpu_hal=warn",
+        );
+        let _ = Builder::from_env(env).try_init();
+        eprintln!("Logging initialized (native)");
+    }
+
+    log::info!("init_logging: is_web={}", is_web);
+}
+
+//run function to start the application
+pub async fn run(is_web: bool) {
+    init_logging(is_web);
+
+    info!("Creating event loop");
+    let event_loop = EventLoop::new().expect("failed to create EventLoop");
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    let mut app = App::new(is_web);
+    info!("Running app");
+    if let Err(e) = event_loop.run_app(&mut app) {
+        error!("Event loop error: {e:?}");
+    }
+}
+
 
 // -------- Uniforms & Instances ----------
 
@@ -37,24 +82,6 @@ use crate::culling;
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
-
-#[derive(Copy, Clone)]
-enum MeshKind {
-    Lowrise,  // block_lowrise
-    Highrise, // tower_highrise
-    Pyramid,  // pyramid_tower
-}
-
-#[derive(Copy, Clone)]
-struct WorldInstanceCPU {
-    model:  Matrix4<f32>,
-    center: Vector3<f32>,
-    half:   Vector3<f32>,
-    kind:   MeshKind,
-}
-
-// Pad the uniform buffer allocation to 256 bytes for maximum backend compatibility.
-const CAMERA_BUFFER_SIZE: u64 = 256;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -71,43 +98,8 @@ fn mat4_to_array(m: &Matrix4<f32>) -> [[f32; 4]; 4] {
     ]
 }
 
-// ---------- Logging Init ----------
-
-fn init_logging(is_web: bool) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = console_log::init_with_level(log::Level::Info);
-        #[cfg(feature = "console-panic-hook")]
-        console_error_panic_hook::set_once();
-        web_sys::console::log_1(&"Logging initialized (WASM)".into());
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use env_logger::{Builder, Env};
-        let env = Env::default().filter_or(
-            "RUST_LOG",
-            "hello_wgpu=trace,wgpu_core=warn,wgpu_hal=warn",
-        );
-        let _ = Builder::from_env(env).try_init();
-        eprintln!("Logging initialized (native)");
-    }
-
-    info!("init_logging: is_web={}", is_web);
-}
-
-pub async fn run(is_web: bool) {
-    init_logging(is_web);
-
-    info!("Creating event loop");
-    let event_loop = EventLoop::new().expect("failed to create EventLoop");
-    event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(is_web);
-    info!("Running app");
-    if let Err(e) = event_loop.run_app(&mut app) {
-        error!("Event loop error: {e:?}");
-    }
-}
+// Pad uniform to 256B (backend alignment)
+const CAMERA_BUFFER_SIZE: u64 = 256;
 
 // -------------------- ENGINE --------------------
 
@@ -129,13 +121,17 @@ struct Engine {
     camera_bg:  wgpu::BindGroup,
     camera_buf: wgpu::Buffer,
 
-    // Meshes
-    mesh_lowrise:   mesh::Mesh, // near/mid
-    mesh_highrise:  mesh::Mesh, // near/mid
-    mesh_pyramid:   mesh::Mesh, // near/mid
-    mesh_billboard: mesh::Mesh, // far
+    // City meshes
+    mesh_lowrise:   mesh::Mesh,
+    mesh_highrise:  mesh::Mesh,
+    mesh_pyramid:   mesh::Mesh,
+    mesh_billboard: mesh::Mesh,
+    mesh_ground:    mesh::Mesh,
 
-    // Instance buffers (per LOD + per mesh where needed)
+    // Ground instance buffer
+    ground_instbuf: wgpu::Buffer,
+
+    // Instance buffers (per LOD + per mesh)
     // LOD0 (near)
     instbuf_lod0_lowrise:  wgpu::Buffer,
     instbuf_lod0_highrise: wgpu::Buffer,
@@ -152,7 +148,7 @@ struct Engine {
     cnt_lod1_highrise: u32,
     cnt_lod1_pyramid:  u32,
 
-    // LOD2 (far) -> billboard for every kind
+    // LOD2 (far) -> single billboard mesh
     instbuf_lod2_billboard: wgpu::Buffer,
     cnt_lod2_billboard: u32,
 }
@@ -175,14 +171,22 @@ impl Engine {
         v1_pyr: &[InstanceRaw],
         // LOD2
         v2_bill: &[InstanceRaw],
+        // Ground (single)
+        ground_model: &InstanceRaw,
     ) {
+        // ground
+        self.queue.write_buffer(&self.ground_instbuf, 0, bytemuck::bytes_of(ground_model));
+
+        // buildings
         if !v0_low.is_empty()  { self.queue.write_buffer(&self.instbuf_lod0_lowrise,  0, bytemuck::cast_slice(v0_low)); }
         if !v0_high.is_empty() { self.queue.write_buffer(&self.instbuf_lod0_highrise, 0, bytemuck::cast_slice(v0_high)); }
         if !v0_pyr.is_empty()  { self.queue.write_buffer(&self.instbuf_lod0_pyramid,  0, bytemuck::cast_slice(v0_pyr)); }
+
         if !v1_low.is_empty()  { self.queue.write_buffer(&self.instbuf_lod1_lowrise,  0, bytemuck::cast_slice(v1_low)); }
         if !v1_high.is_empty() { self.queue.write_buffer(&self.instbuf_lod1_highrise, 0, bytemuck::cast_slice(v1_high)); }
         if !v1_pyr.is_empty()  { self.queue.write_buffer(&self.instbuf_lod1_pyramid,  0, bytemuck::cast_slice(v1_pyr)); }
-        if !v2_bill.is_empty() { self.queue.write_buffer(&self.instbuf_lod2_billboard,0, bytemuck::cast_slice(v2_bill)); }
+
+        if !v2_bill.is_empty() { self.queue.write_buffer(&self.instbuf_lod2_billboard, 0, bytemuck::cast_slice(v2_bill)); }
 
         self.cnt_lod0_lowrise  = v0_low.len()  as u32;
         self.cnt_lod0_highrise = v0_high.len() as u32;
@@ -210,7 +214,7 @@ impl Engine {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load:  wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.02, a: 1.0 }),
+                        load:  wgpu::LoadOp::Clear(wgpu::Color { r: 0.06, g: 0.06, b: 0.08, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -229,7 +233,13 @@ impl Engine {
             rpass.set_pipeline(&self.render_pipeline);
             rpass.set_bind_group(0, &self.camera_bg, &[]);
 
-            // ---- LOD0 NEAR ----
+            // Ground
+            rpass.set_vertex_buffer(0, self.mesh_ground.vertex_buffer.slice(..));
+            rpass.set_index_buffer(self.mesh_ground.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            rpass.set_vertex_buffer(1, self.ground_instbuf.slice(..));
+            rpass.draw_indexed(0..self.mesh_ground.index_count, 0, 0..1);
+
+            // LOD0 NEAR
             if self.cnt_lod0_lowrise > 0 {
                 rpass.set_vertex_buffer(0, self.mesh_lowrise.vertex_buffer.slice(..));
                 rpass.set_index_buffer(self.mesh_lowrise.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -249,7 +259,7 @@ impl Engine {
                 rpass.draw_indexed(0..self.mesh_pyramid.index_count, 0, 0..self.cnt_lod0_pyramid);
             }
 
-            // ---- LOD1 MID ----
+            // LOD1 MID
             if self.cnt_lod1_lowrise > 0 {
                 rpass.set_vertex_buffer(0, self.mesh_lowrise.vertex_buffer.slice(..));
                 rpass.set_index_buffer(self.mesh_lowrise.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -269,7 +279,7 @@ impl Engine {
                 rpass.draw_indexed(0..self.mesh_pyramid.index_count, 0, 0..self.cnt_lod1_pyramid);
             }
 
-            // ---- LOD2 FAR (billboards) ----
+            // LOD2 FAR (billboards)
             if self.cnt_lod2_billboard > 0 {
                 rpass.set_vertex_buffer(0, self.mesh_billboard.vertex_buffer.slice(..));
                 rpass.set_index_buffer(self.mesh_billboard.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -332,10 +342,13 @@ struct App {
     pending_adapter: Arc<Mutex<Option<wgpu::Adapter>>>,
     instance: Option<wgpu::Instance>,
 
-    // CPU-side instances for culling/LOD
-    cpu_instances: Vec<WorldInstanceCPU>,
+    // CPU-side instances (from mesh::generate_city_instances)
+    cpu_instances: Vec<mesh::GeneratedBuilding>,
 
-    // Track how far we've shifted the world (global origin), optional for future use
+    // Ground model (single instance)
+    ground_model: InstanceRaw,
+
+    // Floating origin tracker
     world_origin: cgmath::Vector3<f64>,
 }
 
@@ -356,6 +369,7 @@ impl App {
             pending_adapter: Arc::new(Mutex::new(None)),
             instance: None,
             cpu_instances: Vec::new(),
+            ground_model: InstanceRaw { model: mat4_to_array(&Matrix4::identity()) },
             world_origin: cgmath::Vector3::new(0.0, 0.0, 0.0),
         }
     }
@@ -395,9 +409,7 @@ impl App {
     }
 
     fn finalize_engine(&mut self) {
-        if self.engine.is_some() || !self.engine_ready.load(Ordering::SeqCst) {
-            return;
-        }
+        if self.engine.is_some() || !self.engine_ready.load(Ordering::SeqCst) { return; }
 
         let (device, queue) = {
             let mut slot = self.pending_gpu.lock().unwrap();
@@ -420,9 +432,7 @@ impl App {
         let format = caps.formats[0];
         let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
             wgpu::CompositeAlphaMode::Opaque
-        } else {
-            caps.alpha_modes[0]
-        };
+        } else { caps.alpha_modes[0] };
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -436,7 +446,7 @@ impl App {
         };
         surface.configure(&device, &config);
 
-        // --- Depth
+        // Depth
         let depth_format = wgpu::TextureFormat::Depth24Plus;
         let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
@@ -450,13 +460,13 @@ impl App {
         });
         let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // --- Shader
+        // Shader
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Main Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("assets/shader.wgsl").into()),
         });
 
-        // --- Camera uniform
+        // Camera uniform
         let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Camera BGL"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -485,7 +495,7 @@ impl App {
             }],
         });
 
-        // --- Pipeline
+        // Pipeline
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Pipeline Layout"),
             bind_group_layouts: &[&camera_bgl],
@@ -524,62 +534,38 @@ impl App {
             cache: None,
         });
 
-        // --- Meshes (variety)
-        let mesh_lowrise   = mesh::create_block_lowrise(&device);
-        let mesh_highrise  = mesh::create_tower_highrise(&device);
-        let mesh_pyramid   = mesh::create_pyramid_tower(&device);
-        let mesh_billboard = mesh::create_billboard_quad(&device);
+        // City meshes (one-time)
+        let city_meshes = mesh::create_city_meshes(&device);
 
-        // --- CPU instances with mesh variety
-        let grid = 64usize;
-        let mut cpu_instances = Vec::with_capacity(grid * grid);
+        // Procedural city instances + ground model (CPU side only)
+        let city_params = mesh::CityParams {
+            blocks_x: 16,
+            blocks_z: 16,
+            road_w:  3.0,
+            lot_w:   3.0,
+            lot_d:   3.0,
+            lots_x:  3,
+            lots_z:  3,
+            lot_gap: 0.4,
+            seed:    0xC0FF_EE_u32,
+        };
+        let (buildings, ground_model_m4) = mesh::generate_city_instances(&city_params);
+        self.cpu_instances = buildings;
+        self.ground_model = InstanceRaw { model: mat4_to_array(&ground_model_m4) };
 
-        // half-extents per kind (approx for culling)
-        let half_lowrise  = Vector3::new(1.5, 0.4, 1.0);  // 3.0 x 0.8 x 2.0
-        let half_highrise = Vector3::new(0.45, 3.0, 0.45); // 0.9 x 6.0 x 0.9
-        let half_pyramid  = Vector3::new(1.0, 1.1, 1.0);   // base(1.0) + roof apex
-
-        // simple deterministic "random" from grid coords
-        fn pick_kind(x: u32, z: u32) -> MeshKind {
-            let mut h = x ^ (z << 16) ^ 0x9E3779B9;
-            h = h.wrapping_mul(0x85EBCA6B);
-            let r = (h % 100) as u32;
-            match r {
-                0..=39  => MeshKind::Lowrise,   // 40%
-                40..=79 => MeshKind::Highrise,  // 40%
-                _       => MeshKind::Pyramid,   // 20%
-            }
-        }
-
-        for x in 0..grid {
-            for z in 0..grid {
-                let pos = Vector3::new((x as f32) * 4.0, 0.0, (z as f32) * 4.0);
-                let kind = pick_kind(x as u32, z as u32);
-                let half = match kind {
-                    MeshKind::Lowrise  => half_lowrise,
-                    MeshKind::Highrise => half_highrise,
-                    MeshKind::Pyramid  => half_pyramid,
-                };
-                let model = Matrix4::<f32>::from_translation(pos);
-                cpu_instances.push(WorldInstanceCPU { model, center: pos, half, kind });
-            }
-        }
-        info!("CPU instances created: {}", cpu_instances.len());
-
-        // Count per kind (to size instance buffers)
-        let mut count_low = 0usize;
-        let mut count_high = 0usize;
-        let mut count_pyr = 0usize;
-        for inst in &cpu_instances {
+        // Count per kind to size instance buffers
+        let mut cnt_low = 0usize;
+        let mut cnt_high = 0usize;
+        let mut cnt_pyr = 0usize;
+        for inst in &self.cpu_instances {
             match inst.kind {
-                MeshKind::Lowrise  => count_low += 1,
-                MeshKind::Highrise => count_high += 1,
-                MeshKind::Pyramid  => count_pyr += 1,
+                mesh::BuildingKind::Lowrise  => cnt_low  += 1,
+                mesh::BuildingKind::Highrise => cnt_high += 1,
+                mesh::BuildingKind::Pyramid  => cnt_pyr  += 1,
             }
         }
-        let stride = std::mem::size_of::<InstanceRaw>() as u64;
 
-        // helper to create buffer sized for n instances
+        let stride = std::mem::size_of::<InstanceRaw>() as u64;
         let make_buf = |label: &str, n: usize| -> wgpu::Buffer {
             let size = (n.max(1) as u64) * stride;
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -590,16 +576,19 @@ impl App {
             })
         };
 
-        // LOD0 buffers per kind
-        let instbuf_lod0_lowrise  = make_buf("instbuf_lod0_lowrise",  count_low);
-        let instbuf_lod0_highrise = make_buf("instbuf_lod0_highrise", count_high);
-        let instbuf_lod0_pyramid  = make_buf("instbuf_lod0_pyramid",  count_pyr);
-        // LOD1 buffers per kind
-        let instbuf_lod1_lowrise  = make_buf("instbuf_lod1_lowrise",  count_low);
-        let instbuf_lod1_highrise = make_buf("instbuf_lod1_highrise", count_high);
-        let instbuf_lod1_pyramid  = make_buf("instbuf_lod1_pyramid",  count_pyr);
-        // LOD2 billboard buffer (one for all)
-        let instbuf_lod2_billboard = make_buf("instbuf_lod2_billboard", cpu_instances.len());
+        // LOD0/LOD1 per kind
+        let instbuf_lod0_lowrise  = make_buf("instbuf_lod0_lowrise",  cnt_low);
+        let instbuf_lod0_highrise = make_buf("instbuf_lod0_highrise", cnt_high);
+        let instbuf_lod0_pyramid  = make_buf("instbuf_lod0_pyramid",  cnt_pyr);
+        let instbuf_lod1_lowrise  = make_buf("instbuf_lod1_lowrise",  cnt_low);
+        let instbuf_lod1_highrise = make_buf("instbuf_lod1_highrise", cnt_high);
+        let instbuf_lod1_pyramid  = make_buf("instbuf_lod1_pyramid",  cnt_pyr);
+
+        // LOD2 (all kinds share billboards)
+        let instbuf_lod2_billboard = make_buf("instbuf_lod2_billboard", self.cpu_instances.len());
+
+        // Ground instance buffer (single)
+        let ground_instbuf = make_buf("ground_instbuf", 1);
 
         let mut engine = Engine {
             device,
@@ -614,10 +603,12 @@ impl App {
             camera_bgl,
             camera_bg,
             camera_buf,
-            mesh_lowrise,
-            mesh_highrise,
-            mesh_pyramid,
-            mesh_billboard,
+            mesh_lowrise:   city_meshes.lowrise,
+            mesh_highrise:  city_meshes.highrise,
+            mesh_pyramid:   city_meshes.pyramid,
+            mesh_billboard: city_meshes.billboard,
+            mesh_ground:    city_meshes.ground,
+            ground_instbuf,
             instbuf_lod0_lowrise,
             instbuf_lod0_highrise,
             instbuf_lod0_pyramid,
@@ -636,10 +627,9 @@ impl App {
         engine.resize(size);
 
         self.engine = Some(engine);
-        self.cpu_instances = cpu_instances;
     }
 
-    // ---------------- Floating Origin ----------------
+    // -------- Floating Origin --------
 
     const ORIGIN_SHIFT_DISTANCE: f32 = 500.0;
 
@@ -651,13 +641,12 @@ impl App {
     }
 
     fn shift_world(&mut self, offset: Vector3<f32>) {
-        info!("Floating origin shift by ({:.1}, {:.1}, {:.1})", offset.x, offset.y, offset.z);
-
         for inst in &mut self.cpu_instances {
+            let t = Matrix4::<f32>::from_translation(-offset);
+            inst.model_near_mid = t * inst.model_near_mid;
+            inst.model_far      = t * inst.model_far;
             inst.center -= offset;
-            inst.model = Matrix4::<f32>::from_translation(inst.center);
         }
-
         self.camera.position -= offset;
         self.world_origin += cgmath::Vector3::new(offset.x as f64, offset.y as f64, offset.z as f64);
     }
@@ -762,9 +751,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        if let Some(w) = &self.window { w.request_redraw(); }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -803,36 +790,33 @@ impl ApplicationHandler for App {
                 if dt >= 0.016 {
                     self.camera.update(dt, &self.keyboard_input);
 
-                    // Floating origin before culling/draw
+                    // Floating origin
                     self.maybe_shift_origin();
 
                     self.last_frame_time = now;
                     self.finalize_engine();
 
                     if let Some(engine) = self.engine.as_mut() {
-                        // Compute VP and upload
+                        // VP
                         let size = self.window.as_ref().unwrap().inner_size();
                         let aspect = (size.width.max(1) as f32) / (size.height.max(1) as f32);
                         let vp = self.camera.view_projection(aspect);
                         engine.update_camera(&vp);
 
-                        // --------- CULL + LOD ----------
-                        const LOD0_MAX: f32 = 80.0;   // near
-                        const LOD1_MAX: f32 = 180.0;  // mid
-                        const CULL_MAX: f32 = 350.0;  // far cutoff
+                        // ---- CULL + LOD ----
+                        const LOD0_MAX: f32 = 90.0;
+                        const LOD1_MAX: f32 = 190.0;
+                        const CULL_MAX: f32 = 380.0;
 
                         let fr = culling::frustum_from_vp(&vp);
                         let cam_pos = self.camera.position.to_vec();
 
-                        // Visible lists
-                        let mut v0_low: Vec<InstanceRaw>  = Vec::with_capacity(1024);
-                        let mut v0_high: Vec<InstanceRaw> = Vec::with_capacity(1024);
-                        let mut v0_pyr: Vec<InstanceRaw>  = Vec::with_capacity(1024);
-
-                        let mut v1_low: Vec<InstanceRaw>  = Vec::with_capacity(2048);
-                        let mut v1_high: Vec<InstanceRaw> = Vec::with_capacity(2048);
-                        let mut v1_pyr: Vec<InstanceRaw>  = Vec::with_capacity(2048);
-
+                        let mut v0_low:  Vec<InstanceRaw> = Vec::with_capacity(2048);
+                        let mut v0_high: Vec<InstanceRaw> = Vec::with_capacity(2048);
+                        let mut v0_pyr:  Vec<InstanceRaw> = Vec::with_capacity(2048);
+                        let mut v1_low:  Vec<InstanceRaw> = Vec::with_capacity(4096);
+                        let mut v1_high: Vec<InstanceRaw> = Vec::with_capacity(4096);
+                        let mut v1_pyr:  Vec<InstanceRaw> = Vec::with_capacity(4096);
                         let mut v2_bill: Vec<InstanceRaw> = Vec::with_capacity(4096);
 
                         for inst in &self.cpu_instances {
@@ -840,20 +824,22 @@ impl ApplicationHandler for App {
                             if dist > CULL_MAX { continue; }
                             if !culling::aabb_intersects_frustum(inst.center, inst.half, &fr) { continue; }
 
-                            let raw = InstanceRaw { model: mat4_to_array(&inst.model) };
                             if dist <= LOD0_MAX {
+                                let raw = InstanceRaw { model: mat4_to_array(&inst.model_near_mid) };
                                 match inst.kind {
-                                    MeshKind::Lowrise  => v0_low.push(raw),
-                                    MeshKind::Highrise => v0_high.push(raw),
-                                    MeshKind::Pyramid  => v0_pyr.push(raw),
+                                    mesh::BuildingKind::Lowrise  => v0_low.push(raw),
+                                    mesh::BuildingKind::Highrise => v0_high.push(raw),
+                                    mesh::BuildingKind::Pyramid  => v0_pyr.push(raw),
                                 }
                             } else if dist <= LOD1_MAX {
+                                let raw = InstanceRaw { model: mat4_to_array(&inst.model_near_mid) };
                                 match inst.kind {
-                                    MeshKind::Lowrise  => v1_low.push(raw),
-                                    MeshKind::Highrise => v1_high.push(raw),
-                                    MeshKind::Pyramid  => v1_pyr.push(raw),
+                                    mesh::BuildingKind::Lowrise  => v1_low.push(raw),
+                                    mesh::BuildingKind::Highrise => v1_high.push(raw),
+                                    mesh::BuildingKind::Pyramid  => v1_pyr.push(raw),
                                 }
                             } else {
+                                let raw = InstanceRaw { model: mat4_to_array(&inst.model_far) };
                                 v2_bill.push(raw);
                             }
                         }
@@ -862,31 +848,25 @@ impl ApplicationHandler for App {
                             &v0_low, &v0_high, &v0_pyr,
                             &v1_low, &v1_high, &v1_pyr,
                             &v2_bill,
+                            &self.ground_model,
                         );
 
-                        // Render
                         match engine.render() {
                             Ok(()) => {}
                             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                                 let size = self.window.as_ref().unwrap().inner_size();
                                 engine.resize(size);
                             }
-                            Err(wgpu::SurfaceError::Timeout) => {
-                                warn!("Surface timeout");
-                            }
+                            Err(wgpu::SurfaceError::Timeout) => { warn!("Surface timeout"); }
                             Err(wgpu::SurfaceError::OutOfMemory) => {
                                 error!("Out of memory; exiting");
                                 event_loop.exit();
                             }
-                            Err(wgpu::SurfaceError::Other) => {
-                                error!("Unknown surface error");
-                            }
+                            Err(wgpu::SurfaceError::Other) => { error!("Unknown surface error"); }
                         }
                     }
 
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    if let Some(win) = &self.window { win.request_redraw(); }
                 }
             }
             _ => {}
