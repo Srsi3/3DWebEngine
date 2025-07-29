@@ -3,6 +3,10 @@ pub mod hello_wgpu;
 pub mod mesh;
 pub mod camera;
 pub mod culling;
+pub mod types;
+pub mod render;
+pub mod chunking;
+
 pub use hello_wgpu::run; 
 cfg_if::cfg_if! {
   if #[cfg(target_arch = "wasm32")] {
