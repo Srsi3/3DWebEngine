@@ -2,8 +2,9 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
 use std::time::Duration;
 
 use bytemuck::{Pod, Zeroable};
-use cgmath::{Matrix4, SquareMatrix, Vector3}; // <-- SquareMatrix gives Matrix4::identity()
+use cgmath::{Matrix4, SquareMatrix, Vector3}; // SquareMatrix gives Matrix4::identity()
 use instant::Instant;
+use log::{trace, debug, info, warn, error};
 use wgpu::util::DeviceExt;
 use wgpu::StoreOp;
 use winit::application::ApplicationHandler;
@@ -25,14 +26,17 @@ use winit::platform::web::WindowAttributesExtWebSys;
 use crate::camera;
 use crate::mesh;
 
-// --- Camera uniform (mat4x4<f32> = 64 bytes) ---
+// -------- Uniforms & Instances ----------
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
-// --- Per-instance model matrix (mat4x4<f32>) ---
+// Pad the uniform buffer allocation to 256 bytes for maximum backend compatibility.
+const CAMERA_BUFFER_SIZE: u64 = 256;
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct InstanceRaw {
@@ -48,11 +52,43 @@ fn mat4_to_array(m: &Matrix4<f32>) -> [[f32; 4]; 4] {
     ]
 }
 
+// ---------- Logging Init ----------
+
+fn init_logging(is_web: bool) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Log to browser console; default to info if no RUST_LOG given.
+        let _ = console_log::init_with_level(log::Level::Info);
+        #[cfg(feature = "console-panic-hook")]
+        console_error_panic_hook::set_once();
+        web_sys::console::log_1(&"Logging initialized (WASM)".into());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use env_logger::{Builder, Env};
+        let env = Env::default().filter_or(
+            "RUST_LOG",
+            "hello_wgpu=trace,wgpu_core=warn,wgpu_hal=warn",
+        );
+        let _ = Builder::from_env(env).try_init();
+        eprintln!("Logging initialized (native)");
+    }
+
+    info!("init_logging: is_web={}", is_web);
+}
+
 pub async fn run(is_web: bool) {
-    let event_loop = EventLoop::new().unwrap();
+    init_logging(is_web);
+
+    info!("Creating event loop");
+    let event_loop = EventLoop::new().expect("failed to create EventLoop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(is_web);
-    event_loop.run_app(&mut app).unwrap();
+    info!("Running app");
+    if let Err(e) = event_loop.run_app(&mut app) {
+        error!("Event loop error: {e:?}");
+    }
 }
 
 struct Engine {
@@ -81,24 +117,28 @@ struct Engine {
 
 impl Engine {
     fn update_camera(&self, vp: &Matrix4<f32>) {
+        trace!("update_camera: uploading VP matrix");
         let data = CameraUniform { view_proj: mat4_to_array(vp) };
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&data));
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let frame = self.surface.get_current_texture()?; // may error (Lost/Outdated/Timeout/OutOfMemory)
+        trace!("render: acquiring current texture");
+        let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        trace!("render: creating command encoder");
         let mut encoder = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("Main Encoder") }
         );
 
+        trace!("render: begin render pass");
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
-                    depth_slice: None, // None for 2D color target
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.05, a: 1.0 }),
@@ -120,17 +160,19 @@ impl Engine {
             rpass.set_pipeline(&self.render_pipeline);
             rpass.set_bind_group(0, &self.camera_bg, &[]);
             rpass.set_vertex_buffer(0, self.cube_mesh.vertex_buffer.slice(..));
-            rpass.set_vertex_buffer(1, self.instance_buf.slice(..)); // per-instance model matrices
+            rpass.set_vertex_buffer(1, self.instance_buf.slice(..));
             rpass.set_index_buffer(self.cube_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             rpass.draw_indexed(0..self.cube_mesh.index_count, 0, 0..self.instance_count);
         }
 
+        trace!("render: submitting queue");
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
     }
 
     fn recreate_depth(&mut self, width: u32, height: u32) {
+        info!("recreate_depth: {}x{}", width, height);
         let desc = wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -146,7 +188,11 @@ impl Engine {
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width == 0 || new_size.height == 0 { return; }
+        if new_size.width == 0 || new_size.height == 0 {
+            warn!("resize: skipped (zero dimension) {}x{}", new_size.width, new_size.height);
+            return;
+        }
+        info!("resize: {}x{}", new_size.width, new_size.height);
         self.config.width = new_size.width;
         self.config.height = new_size.height;
         self.surface.configure(&self.device, &self.config);
@@ -178,6 +224,7 @@ struct App {
 
 impl App {
     fn new(is_web: bool) -> Self {
+        info!("App::new(is_web={})", is_web);
         Self {
             is_web,
             window: None,
@@ -200,15 +247,23 @@ impl App {
         out_slot: Arc<Mutex<Option<(wgpu::Device, wgpu::Queue)>>>,
         ready: Arc<AtomicBool>,
     ) {
+        info!("build_device_queue: requesting device from adapter");
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
             .unwrap();
+
+        // Log uncaptured wgpu errors (validation, etc.)
+        device.on_uncaptured_error(Box::new(|e| {
+            error!("WGPU Uncaptured Error: {e:?}");
+        }));
+
         {
             let mut slot = out_slot.lock().unwrap();
             *slot = Some((device, queue));
         }
         ready.store(true, Ordering::SeqCst);
+        info!("build_device_queue: device/queue ready");
     }
 
     fn instance_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
@@ -227,10 +282,16 @@ impl App {
     }
 
     fn finalize_engine(&mut self) {
-        if self.engine.is_some() || !self.engine_ready.load(Ordering::SeqCst) {
+        if self.engine.is_some() {
+            trace!("finalize_engine: already created");
+            return;
+        }
+        if !self.engine_ready.load(Ordering::SeqCst) {
+            trace!("finalize_engine: not ready yet");
             return;
         }
 
+        info!("finalize_engine: starting");
         let (device, queue) = {
             let mut slot = self.pending_gpu.lock().unwrap();
             slot.take().expect("ready flag set but no device/queue stored")
@@ -247,9 +308,21 @@ impl App {
             a
         };
 
+        let info = adapter.get_info();
+        info!("Adapter: name='{}', backend={:?}", info.name, info.backend);
+
         let size = self.window.as_ref().unwrap().inner_size();
         let caps = surface.get_capabilities(&adapter);
+        debug!("Surface caps: formats={:?}, present_modes={:?}, alpha_modes={:?}",
+            caps.formats, caps.present_modes, caps.alpha_modes);
+
         let format = caps.formats[0];
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes[0]
+        };
+        info!("Chosen surface format={:?}, alpha={:?}", format, alpha_mode);
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -257,14 +330,15 @@ impl App {
             width: size.width,
             height: size.height,
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 0,
         };
         surface.configure(&device, &config);
+        info!("Surface configured: {}x{}", size.width, size.height);
 
         // --- Depth setup ---
-        let depth_format = wgpu::TextureFormat::Depth24Plus; // works on native and WebGL2
+        let depth_format = wgpu::TextureFormat::Depth24Plus;
         let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
             size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
@@ -276,12 +350,14 @@ impl App {
             view_formats: &[],
         });
         let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        info!("Depth texture created ({:?})", depth_format);
 
         // --- Shader ---
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Main Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("assets/shader.wgsl").into()),
         });
+        info!("Shader module created");
 
         // --- Camera BGL/BG/Buffer (group=0, binding=0) ---
         let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -292,19 +368,17 @@ impl App {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<CameraUniform>() as u64),
+                    min_binding_size: wgpu::BufferSize::new(64), // mat4x4<f32>
                 },
                 count: None,
             }],
         });
-
-        let cam_init = CameraUniform { view_proj: Matrix4::<f32>::identity().into() };
-        let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Camera Buffer"),
-            contents: bytemuck::bytes_of(&cam_init),
+            size: CAMERA_BUFFER_SIZE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
-
         let camera_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Camera BG"),
             layout: &camera_bgl,
@@ -313,6 +387,7 @@ impl App {
                 resource: camera_buf.as_entire_binding(),
             }],
         });
+        info!("Camera uniform created (buffer {} bytes)", CAMERA_BUFFER_SIZE);
 
         // --- Pipeline layout (use camera group at index 0) ---
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -345,7 +420,7 @@ impl App {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
                 depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less, // standard depth test
+                depth_compare: wgpu::CompareFunction::Less,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -353,11 +428,13 @@ impl App {
             multiview: None,
             cache: None,
         });
+        info!("Render pipeline created");
 
         // --- Mesh & instances ---
         let cube_mesh = mesh::create_cube(&device);
+        info!("Cube mesh buffers ready (indices: {})", cube_mesh.index_count);
 
-        // Build a grid of instance transforms (e.g., 10x10)
+        // Grid of instances (10x10)
         let grid = 10usize;
         let mut instance_data = Vec::with_capacity(grid * grid);
         for x in 0..grid {
@@ -376,6 +453,7 @@ impl App {
             contents: bytemuck::cast_slice(&instance_data),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
+        info!("Instance buffer created ({} instances)", instance_count);
 
         let mut engine = Engine {
             device,
@@ -397,13 +475,13 @@ impl App {
         engine.resize(size);
 
         self.engine = Some(engine);
-        #[cfg(target_arch = "wasm32")]
-        web_sys::console::log_1(&"Engine finalized".into());
+        info!("finalize_engine: done");
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        info!("Application resumed");
         let window_attributes = if self.is_web {
             #[cfg(target_arch = "wasm32")]
             {
@@ -418,6 +496,7 @@ impl ApplicationHandler for App {
                     let h = canvas.client_height() as u32;
                     canvas.set_width(w);
                     canvas.set_height(h);
+                    info!("Canvas size initialized to {}x{}", w, h);
                 }
                 WindowAttributes::default()
                     .with_title("3D Web Engine")
@@ -432,6 +511,7 @@ impl ApplicationHandler for App {
         };
 
         let window = event_loop.create_window(window_attributes).unwrap();
+        info!("Window created");
         self.window = Some(window);
 
         let backends = if self.is_web {
@@ -439,6 +519,7 @@ impl ApplicationHandler for App {
         } else {
             wgpu::Backends::all()
         };
+        info!("Using backends: {:?}", backends);
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
@@ -447,9 +528,12 @@ impl ApplicationHandler for App {
         self.instance = Some(instance);
         let instance_ref = self.instance.as_ref().unwrap();
 
-        let tempsurface = unsafe { instance_ref.create_surface(self.window.as_ref().unwrap()).unwrap() };
+        let tempsurface = unsafe {
+            instance_ref.create_surface(self.window.as_ref().unwrap()).expect("create_surface failed")
+        };
         let surface: wgpu::Surface<'static> = unsafe { std::mem::transmute(tempsurface) };
         self.surface = Some(surface);
+        info!("Surface created");
 
         let ready_flag = Arc::clone(&self.engine_ready);
         let out_slot   = Arc::clone(&self.pending_gpu);
@@ -459,27 +543,36 @@ impl ApplicationHandler for App {
         {
             let backends_copy  = backends;
 
+            info!("Requesting adapter (web)");
             wasm_bindgen_futures::spawn_local(async move {
                 let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
                     backends: backends_copy,
                     ..Default::default()
                 });
 
-                let adapter = instance
+                match instance
                     .request_adapter(&wgpu::RequestAdapterOptions {
                         power_preference: wgpu::PowerPreference::HighPerformance,
                         compatible_surface: None,
                         force_fallback_adapter: false,
                     })
                     .await
-                    .expect("no adapter");
-                { *adapter_slot.lock().unwrap() = Some(adapter.clone()); }
-                App::build_device_queue(adapter, out_slot, ready_flag).await;
+                {
+                    Some(adapter) => {
+                        info!("Adapter acquired (web)");
+                        { *adapter_slot.lock().unwrap() = Some(adapter.clone()); }
+                        App::build_device_queue(adapter, out_slot, ready_flag).await;
+                    }
+                    None => {
+                        error!("No adapter available (web)");
+                    }
+                }
             });
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
+            info!("Requesting adapter (native)");
             let adapter = pollster::block_on(instance_ref.request_adapter(
                 &wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
@@ -488,9 +581,11 @@ impl ApplicationHandler for App {
                 },
             ))
             .expect("No compatible adapter found");
+            info!("Adapter acquired (native)");
             self.adapter = Some(adapter.clone());
 
             std::thread::spawn(move || {
+                info!("Spawning device/queue creation thread");
                 pollster::block_on(async {
                     App::build_device_queue(adapter, out_slot, ready_flag).await;
                 });
@@ -510,14 +605,20 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => {
-                println!("The close button was pressed; stopping");
+                info!("Close requested; exiting");
                 event_loop.exit();
             },
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match event.state {
-                        ElementState::Pressed => self.keyboard_input.key_press(code),
-                        ElementState::Released => self.keyboard_input.key_release(code),
+                        ElementState::Pressed => {
+                            trace!("key down: {:?}", code);
+                            self.keyboard_input.key_press(code)
+                        }
+                        ElementState::Released => {
+                            trace!("key up: {:?}", code);
+                            self.keyboard_input.key_release(code)
+                        }
                     }
                 }
             }
@@ -532,6 +633,7 @@ impl ApplicationHandler for App {
             }
             _ => {},
             WindowEvent::Resized(size) => {
+                info!("Window resized: {}x{}", size.width, size.height);
                 if let Some(engine) = self.engine.as_mut() {
                     engine.resize(size);
                 }
@@ -546,7 +648,6 @@ impl ApplicationHandler for App {
                     self.finalize_engine();
 
                     if let Some(engine) = self.engine.as_mut() {
-                        // Compute VP and upload to the uniform
                         let size = self.window.as_ref().unwrap().inner_size();
                         let aspect = (size.width.max(1) as f32) / (size.height.max(1) as f32);
                         let vp = self.camera.view_projection(aspect);
@@ -555,20 +656,23 @@ impl ApplicationHandler for App {
                         match engine.render() {
                             Ok(()) => {}
                             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                                warn!("Surface lost/outdated; reconfiguring");
                                 let size = self.window.as_ref().unwrap().inner_size();
                                 engine.resize(size);
                             }
                             Err(wgpu::SurfaceError::Timeout) => {
-                                eprintln!("Surface timeout");
+                                warn!("Surface timeout");
                             }
                             Err(wgpu::SurfaceError::OutOfMemory) => {
-                                eprintln!("Out of memory");
+                                error!("Out of memory; exiting");
                                 event_loop.exit();
                             }
                             Err(wgpu::SurfaceError::Other) => {
-                                eprintln!("Unknown surface error");
+                                error!("Unknown surface error");
                             }
                         }
+                    } else {
+                        trace!("RedrawRequested: engine not ready yet");
                     }
 
                     if let Some(win) = &self.window {

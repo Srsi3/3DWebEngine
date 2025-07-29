@@ -24,10 +24,9 @@ struct VsOut {
 fn vs_main(in: VsIn) -> VsOut {
     var out : VsOut;
 
-    // Reconstruct per-instance model matrix
     let model = mat4x4<f32>(in.i_m0, in.i_m1, in.i_m2, in.i_m3);
-
     let world_pos = model * vec4<f32>(in.position, 1.0);
+
     out.pos   = uCamera.viewProj * world_pos;
     out.color = in.color;
     return out;
