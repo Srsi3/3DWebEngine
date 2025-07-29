@@ -1,10 +1,8 @@
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
-use std::time::Duration;
-use std::collections::VecDeque;
 
 use cgmath::{
     Matrix4, SquareMatrix, Vector3,
-    EuclideanSpace, InnerSpace, // to_vec(), magnitude(), dot()
+    EuclideanSpace, InnerSpace,
 };
 use instant::Instant;
 use log::{info, warn, error};
@@ -27,7 +25,7 @@ use winit::platform::web::WindowAttributesExtWebSys;
 use crate::camera;
 use crate::culling;
 use crate::mesh;
-use crate::types::{CameraUniform, InstanceRaw, mat4_to_array};
+use crate::types::InstanceRaw;
 use crate::render::Engine;
 use crate::chunking::ChunkManager;
 
@@ -87,13 +85,13 @@ struct App {
     pending_adapter: Arc<Mutex<Option<wgpu::Adapter>>>,
     instance: Option<wgpu::Instance>,
 
-    // chunking
+    // chunking + finite world
     chunk_mgr: ChunkManager,
 
     // ground
     ground_model: InstanceRaw,
 
-    // floating origin accumulator (double for precision, but we only need f32 shift when applying)
+    // floating origin accumulator
     world_origin: cgmath::Vector3<f64>,
 
     // LOD/cull ranges
@@ -108,6 +106,7 @@ struct App {
 
 impl App {
     fn new(is_web: bool) -> Self {
+        // City params (generation)
         let params = mesh::CityGenParams {
             lots_x: 3, lots_z: 3,
             lot_w: 3.0, lot_d: 3.0, lot_gap: 0.4,
@@ -115,7 +114,16 @@ impl App {
             blocks_per_chunk_x: 8, blocks_per_chunk_z: 8,
             seed: 0xC0FF_EE_u64,
         };
-        let chunk_mgr = ChunkManager::new(params, 3);
+
+        // Finite world bounds (inclusive chunk coords).
+        // Example: a 9×9 chunk world centered at 0 => [-4..=4]
+        let bounds = (-4, 4, -4, 4);
+        let bake_on_miss = true;
+
+        let chunk_mgr = ChunkManager::new(
+            params, 3, bounds, bake_on_miss,
+            "./city_chunks" // native dir; web uses localStorage instead
+        );
 
         Self {
             is_web,
@@ -129,7 +137,7 @@ impl App {
             pending_adapter: Arc::new(Mutex::new(None)),
             instance: None,
             chunk_mgr,
-            ground_model: InstanceRaw { model: mat4_to_array(&Matrix4::identity()) },
+            ground_model: InstanceRaw { pos: [0.0, -0.05, 0.0, 0.0], scale: [1.0, 1.0, 1.0, 0.0] },
             world_origin: cgmath::Vector3::new(0.0, 0.0, 0.0),
             lod0_max: 90.0, lod1_max: 190.0, cull_max: 380.0,
             debug_enabled: false,
@@ -167,11 +175,7 @@ impl App {
         };
 
         let size = self.window.as_ref().unwrap().inner_size();
-        let mut engine = Engine::new(device, queue, surface, &adapter, size);
-        // ground model (slightly below y=0 to avoid z-fight)
-        let ground_m = Matrix4::<f32>::from_translation(Vector3::new(0.0, -0.05, 0.0));
-        self.ground_model = InstanceRaw { model: mat4_to_array(&ground_m) };
-
+        let engine = Engine::new(device, queue, surface, &adapter, size);
         self.engine = Some(engine);
     }
 
@@ -186,11 +190,8 @@ impl App {
     }
 
     fn shift_world(&mut self, offset: Vector3<f32>) {
-        // shift chunks
         self.chunk_mgr.apply_shift(offset);
-        // shift camera
         self.camera.position -= offset;
-        // track
         self.world_origin += cgmath::Vector3::new(offset.x as f64, offset.y as f64, offset.z as f64);
     }
 }
@@ -309,15 +310,14 @@ impl ApplicationHandler for App {
                             Digit6 => { self.cull_max += 20.0; info!("CULL_MAX => {:.1}", self.cull_max); }
                             BracketLeft  => { self.chunk_mgr.chunk_radius = (self.chunk_mgr.chunk_radius - 1).max(1); info!("Chunk radius => {}", self.chunk_mgr.chunk_radius); }
                             BracketRight => { self.chunk_mgr.chunk_radius = (self.chunk_mgr.chunk_radius + 1).min(8); info!("Chunk radius => {}", self.chunk_mgr.chunk_radius); }
-                            KeyR => { // reseed
+                            KeyR => { // reseed & clear store (only in-bounds when visiting will be re-saved)
                                 self.chunk_mgr.params.seed ^= (Instant::now().elapsed().as_nanos() as u64);
                                 self.chunk_mgr.loaded.clear();
-                                info!("World reseeded; chunks cleared");
+                                info!("World reseeded; chunks cleared (store not cleared).");
                             }
                             _ => {}
                         }
                     }
-                    // your normal input tracking
                     match event.state {
                         ElementState::Pressed => self.keyboard_input.key_press(code),
                         ElementState::Released => self.keyboard_input.key_release(code),
@@ -349,7 +349,7 @@ impl ApplicationHandler for App {
                     self.finalize_engine();
 
                     if let Some(engine) = self.engine.as_mut() {
-                        // ensure chunks
+                        // ensure chunks in bounds (and bake/load)
                         let shift = cgmath::Vector3::new(
                             self.world_origin.x as f32, self.world_origin.y as f32, self.world_origin.z as f32
                         );
@@ -361,7 +361,7 @@ impl ApplicationHandler for App {
                         let vp = self.camera.view_projection(aspect);
                         engine.update_camera(&vp);
 
-                        // cull + LOD
+                        // cull + LOD (compact instances)
                         let fr = culling::frustum_from_vp(&vp);
                         let cam_pos = self.camera.position.to_vec();
 
@@ -376,27 +376,44 @@ impl ApplicationHandler for App {
                         let mut stats_visible = 0usize;
                         for list in self.chunk_mgr.loaded.values() {
                             for b in list {
-                                let dist = (b.center - cam_pos).magnitude();
+                                let dist = (b.pos_center - cam_pos).magnitude();
                                 if dist > self.cull_max { continue; }
-                                if !culling::aabb_intersects_frustum(b.center, b.half, &fr) { continue; }
+
+                                let base_half = mesh::base_half_for(b.kind);
+                                let half = cgmath::Vector3::new(
+                                    base_half.x * b.scale.x,
+                                    base_half.y * b.scale.y,
+                                    base_half.z * b.scale.z,
+                                );
+                                if !culling::aabb_intersects_frustum(b.pos_center, half, &fr) { continue; }
                                 stats_visible += 1;
 
                                 if dist <= self.lod0_max {
-                                    let raw = InstanceRaw { model: mat4_to_array(&b.model_near_mid) };
+                                    let raw = InstanceRaw {
+                                        pos:   [b.pos_center.x, b.pos_center.y, b.pos_center.z, 0.0],
+                                        scale: [b.scale.x,      b.scale.y,      b.scale.z,      0.0],
+                                    };
                                     match b.kind {
                                         mesh::BuildingKind::Lowrise  => v0_low.push(raw),
                                         mesh::BuildingKind::Highrise => v0_high.push(raw),
                                         mesh::BuildingKind::Pyramid  => v0_pyr.push(raw),
                                     }
                                 } else if dist <= self.lod1_max {
-                                    let raw = InstanceRaw { model: mat4_to_array(&b.model_near_mid) };
+                                    let raw = InstanceRaw {
+                                        pos:   [b.pos_center.x, b.pos_center.y, b.pos_center.z, 0.0],
+                                        scale: [b.scale.x,      b.scale.y,      b.scale.z,      0.0],
+                                    };
                                     match b.kind {
                                         mesh::BuildingKind::Lowrise  => v1_low.push(raw),
                                         mesh::BuildingKind::Highrise => v1_high.push(raw),
                                         mesh::BuildingKind::Pyramid  => v1_pyr.push(raw),
                                     }
                                 } else {
-                                    let raw = InstanceRaw { model: mat4_to_array(&b.model_far) };
+                                    // billboard footprint from half
+                                    let raw = InstanceRaw {
+                                        pos:   [b.pos_center.x, b.pos_center.y, b.pos_center.z, 0.0],
+                                        scale: [half.x.max(0.5), (half.y*2.0).max(0.5), 1.0, 0.0],
+                                    };
                                     v2_bill.push(raw);
                                 }
                             }
@@ -409,7 +426,6 @@ impl ApplicationHandler for App {
                             &self.ground_model,
                         );
 
-                        // optional debug once/sec
                         if self.debug_enabled && self.debug_last_print.elapsed().as_secs_f32() > 1.0 {
                             info!(
                                 "Chunks: {} | Visible:{}  L0 {}+{}+{}  L1 {}+{}+{}  L2 {} | cam=({:.1},{:.1},{:.1}) origin=({:.0},{:.0},{:.0})",
@@ -423,7 +439,6 @@ impl ApplicationHandler for App {
                             self.debug_last_print = Instant::now();
                         }
 
-                        // draw
                         match engine.render() {
                             Ok(()) => {}
                             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {

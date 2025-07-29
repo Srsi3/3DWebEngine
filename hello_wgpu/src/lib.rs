@@ -6,6 +6,7 @@ pub mod culling;
 pub mod types;
 pub mod render;
 pub mod chunking;
+pub mod city_store;
 
 pub use hello_wgpu::run; 
 cfg_if::cfg_if! {

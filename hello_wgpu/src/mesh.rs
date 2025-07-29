@@ -17,9 +17,7 @@ impl Vertex {
             array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
-                // position @ location 0
                 wgpu::VertexAttribute { shader_location: 0, offset: 0,  format: wgpu::VertexFormat::Float32x3 },
-                // color @ location 1
                 wgpu::VertexAttribute { shader_location: 1, offset: 12, format: wgpu::VertexFormat::Float32x4 },
             ],
         }
@@ -49,7 +47,6 @@ fn upload(device: &wgpu::Device, vertices: &[Vertex], indices: &[u16], label: &s
 // ---------- Mesh builders ----------
 
 fn build_box_vertices(hx: f32, hy: f32, hz: f32, face_colors: [[f32; 4]; 6]) -> (Vec<Vertex>, Vec<u16>) {
-    // 6 faces * 4 vertices each
     let positions = [
         // +X
         [ hx,-hy,-hz], [ hx,-hy, hz], [ hx, hy,-hz], [ hx, hy, hz],
@@ -81,6 +78,11 @@ fn build_box_vertices(hx: f32, hy: f32, hz: f32, face_colors: [[f32; 4]; 6]) -> 
     (vertices, indices)
 }
 
+pub fn create_cuboid(device: &wgpu::Device, w: f32, h: f32, d: f32, color: [f32; 4]) -> Mesh {
+    let (v, i) = build_box_vertices(w*0.5, h*0.5, d*0.5, [color; 6]);
+    upload(device, &v, &i, "Cuboid")
+}
+
 /// 1×1×1 cube centered at origin.
 pub fn create_cube(device: &wgpu::Device) -> Mesh {
     let (v, i) = build_box_vertices(
@@ -91,12 +93,6 @@ pub fn create_cube(device: &wgpu::Device) -> Mesh {
         ]
     );
     upload(device, &v, &i, "Cube")
-}
-
-/// General cuboid with a uniform color applied to all faces.
-pub fn create_cuboid(device: &wgpu::Device, w: f32, h: f32, d: f32, color: [f32; 4]) -> Mesh {
-    let (v, i) = build_box_vertices(w*0.5, h*0.5, d*0.5, [color; 6]);
-    upload(device, &v, &i, "Cuboid")
 }
 
 /// Wide, low-rise block (warehouse-like).
@@ -135,21 +131,20 @@ pub fn create_pyramid_tower(device: &wgpu::Device) -> Mesh {
     vertices.extend_from_slice(&[c0,c1,c2,c3,apex]);
 
     let (i0,i1,i2,i3,ia) = (base_idx, base_idx+1, base_idx+2, base_idx+3, base_idx+4);
-    indices.extend_from_slice(&[
-        i0,i1,ia,  i1,i3,ia,  i3,i2,ia,  i2,i0,ia
-    ]);
+    indices.extend_from_slice(&[ i0,i1,ia,  i1,i3,ia,  i3,i2,ia,  i2,i0,ia ]);
 
     upload(device, &vertices, &indices, "Pyramid Tower")
 }
 
-/// Vertical quad (1.5×2.5) on the X‑Y plane, facing +Z.
+/// Vertical quad (1.5×2.5) centered at origin in XY plane, facing +Z.
+/// Centered so instance 'pos' places its center correctly for all meshes.
 pub fn create_billboard_quad(device: &wgpu::Device) -> Mesh {
-    let w = 1.5; let h = 2.5; let hw = w*0.5;
+    let w = 1.5; let h = 2.5; let hw = w*0.5; let hh = h*0.5;
     let v = vec![
-        Vertex { position: [-hw, 0.0, 0.0], color: [0.80,0.80,0.85,1.0] },
-        Vertex { position: [ hw, 0.0, 0.0], color: [0.80,0.80,0.85,1.0] },
-        Vertex { position: [-hw, h,   0.0], color: [0.85,0.85,0.90,1.0] },
-        Vertex { position: [ hw, h,   0.0], color: [0.85,0.85,0.90,1.0] },
+        Vertex { position: [-hw, -hh, 0.0], color: [0.80,0.80,0.85,1.0] },
+        Vertex { position: [ hw, -hh, 0.0], color: [0.80,0.80,0.85,1.0] },
+        Vertex { position: [-hw,  hh, 0.0], color: [0.85,0.85,0.90,1.0] },
+        Vertex { position: [ hw,  hh, 0.0], color: [0.85,0.85,0.90,1.0] },
     ];
     let i: [u16; 6] = [0,1,2, 2,1,3];
     upload(device, &v, &i, "Billboard Quad")
@@ -177,49 +172,91 @@ pub fn create_city_meshes(device: &wgpu::Device) -> CityMeshes {
     }
 }
 
-// ---------- Procedural, chunkable city generation ----------
+// ---------- Procedural, chunkable city generation (compact) ----------
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, serde::Serialize, serde::Deserialize)]
 pub enum BuildingKind { Lowrise, Highrise, Pyramid }
 
-#[derive(Clone)]
-pub struct GeneratedBuilding {
-    pub model_near_mid: Matrix4<f32>,
-    pub model_far:      Matrix4<f32>,
-    pub center:         Vector3<f32>,
-    pub half:           Vector3<f32>,
-    pub kind:           BuildingKind,
+#[derive(Copy, Clone)]
+pub struct BuildingRecord {
+    pub pos_center: cgmath::Vector3<f32>,
+    pub scale:      cgmath::Vector3<f32>,
+    pub kind:       BuildingKind,
 }
 
-#[derive(Clone, Copy)]
-pub struct CityGenParams {
-    // lots inside a block
-    pub lots_x: usize,
-    pub lots_z: usize,
-    pub lot_w:  f32,
-    pub lot_d:  f32,
-    pub lot_gap: f32,
+/// Disk form (Serialize) — keep it compact.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct BuildingDisk {
+    pub pos:   [f32; 3],
+    pub scale: [f32; 3],
+    pub kind:  u8,
+}
 
-    // roads
-    pub road_w_minor: f32,   // between blocks
-    pub road_w_major: f32,   // boulevards
-    pub major_every:  usize, // every N blocks
-
-    // blocks per chunk
-    pub blocks_per_chunk_x: usize,
-    pub blocks_per_chunk_z: usize,
-
-    pub seed: u64,
+impl From<&BuildingRecord> for BuildingDisk {
+    fn from(b: &BuildingRecord) -> Self {
+        let kind = match b.kind {
+            BuildingKind::Lowrise => 0u8,
+            BuildingKind::Highrise => 1u8,
+            BuildingKind::Pyramid => 2u8,
+        };
+        Self {
+            pos:   [b.pos_center.x, b.pos_center.y, b.pos_center.z],
+            scale: [b.scale.x, b.scale.y, b.scale.z],
+            kind,
+        }
+    }
+}
+impl From<&BuildingDisk> for BuildingRecord {
+    fn from(d: &BuildingDisk) -> Self {
+        let kind = match d.kind {
+            0 => BuildingKind::Lowrise,
+            1 => BuildingKind::Highrise,
+            _ => BuildingKind::Pyramid,
+        };
+        Self {
+            pos_center: cgmath::Vector3::new(d.pos[0], d.pos[1], d.pos[2]),
+            scale:      cgmath::Vector3::new(d.scale[0], d.scale[1], d.scale[2]),
+            kind,
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
-struct HalfExtents { x: f32, y: f32, z: f32 }
+pub struct HalfExtents { pub(crate) x: f32, pub(crate) y: f32, pub(crate) z: f32 }
 #[derive(Copy, Clone)]
 struct PyramidBase { half: HalfExtents, roof_h: f32 }
 
 const BASE_LOW:  HalfExtents = HalfExtents { x: 1.5,  y: 0.4, z: 1.0 };
 const BASE_HIGH: HalfExtents = HalfExtents { x: 0.45, y: 3.0, z: 0.45 };
 const BASE_PYR:  PyramidBase = PyramidBase { half: HalfExtents { x: 1.0, y: 0.6, z: 1.0 }, roof_h: 0.9 };
+
+/// Public: base half extents per kind (used by culling to compute AABB from scale).
+pub fn base_half_for(kind: BuildingKind) -> HalfExtents {
+    match kind {
+        BuildingKind::Lowrise  => BASE_LOW,
+        BuildingKind::Highrise => BASE_HIGH,
+        BuildingKind::Pyramid  => HalfExtents {
+            x: BASE_PYR.half.x,
+            y: (BASE_PYR.half.y * 2.0 + BASE_PYR.roof_h) * 0.5,
+            z: BASE_PYR.half.z,
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct CityGenParams {
+    pub lots_x: usize,
+    pub lots_z: usize,
+    pub lot_w:  f32,
+    pub lot_d:  f32,
+    pub lot_gap: f32,
+    pub road_w_minor: f32,
+    pub road_w_major: f32,
+    pub major_every:  usize,
+    pub blocks_per_chunk_x: usize,
+    pub blocks_per_chunk_z: usize,
+    pub seed: u64,
+}
 
 fn block_world_span(params: &CityGenParams) -> (f32, f32) {
     let span_x = params.lots_x as f32 * (params.lot_w + params.lot_gap) - params.lot_gap;
@@ -245,7 +282,6 @@ impl XorShift64 {
     fn unit_f32(&mut self) -> f32 { (self.next() as f64 / u64::MAX as f64) as f32 }
 }
 fn hash2(a: i32, b: i32) -> u64 {
-    // SplitMix-ish
     let mut x = (a as i64 as i128) as u128 ^ (((b as i64 as i128) << 1) as u128) ^ 0x9E37_79B9_7F4A_7C15u128;
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9u128);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EBu128);
@@ -261,54 +297,13 @@ fn zone_weights(x: f32, z: f32) -> (f32,f32,f32) {
     (w_low.max(0.05), w_high.max(0.05), w_pyr)
 }
 
-fn place_models_and_aabb(kind: BuildingKind, sx: f32, sy: f32, sz: f32, x: f32, z: f32)
-    -> (Matrix4<f32>, Vector3<f32>, Vector3<f32>, Matrix4<f32>)
-{
-    let (model_near_mid, center, half) = match kind {
-        BuildingKind::Lowrise => {
-            let half = Vector3::new(BASE_LOW.x*sx, BASE_LOW.y*sy, BASE_LOW.z*sz);
-            let t = Matrix4::from_translation(Vector3::new(x, half.y, z));
-            let s = Matrix4::from_nonuniform_scale(sx, sy, sz);
-            (t*s, Vector3::new(x, half.y, z), half)
-        }
-        BuildingKind::Highrise => {
-            let half = Vector3::new(BASE_HIGH.x*sx, BASE_HIGH.y*sy, BASE_HIGH.z*sz);
-            let t = Matrix4::from_translation(Vector3::new(x, half.y, z));
-            let s = Matrix4::from_nonuniform_scale(sx, sy, sz);
-            (t*s, Vector3::new(x, half.y, z), half)
-        }
-        BuildingKind::Pyramid => {
-            let base_h = BASE_PYR.half.y * 2.0;
-            let total_h = base_h + BASE_PYR.roof_h;
-            let t = Matrix4::from_translation(Vector3::new(x, (base_h*0.5)*sy, z));
-            let s = Matrix4::from_nonuniform_scale(sx, sy, sz);
-            let center = Vector3::new(x, (total_h*0.5)*sy, z);
-            let half = Vector3::new(BASE_PYR.half.x*sx, (total_h*0.5)*sy, BASE_PYR.half.z*sz);
-            (t*s, center, half)
-        }
-    };
-
-    // Billboard (base 1.5x2.5)
-    let bill_w = (half.x * 2.0).max(0.5);
-    let bill_h = (half.y * 2.0).max(0.5);
-    let sx_bill = bill_w / 1.5;
-    let sy_bill = bill_h / 2.5;
-    let model_far = Matrix4::from_translation(Vector3::new(x, bill_h*0.5, z))
-        * Matrix4::from_nonuniform_scale(sx_bill, sy_bill, 1.0);
-
-    (model_near_mid, center, half, model_far)
-}
-
-/// Generate buildings for a single chunk at integer coords (cx, cz).
-pub struct CityChunk { pub buildings: Vec<GeneratedBuilding> }
+pub struct CityChunk { pub buildings: Vec<BuildingRecord> }
 
 pub fn generate_city_chunk(params: &CityGenParams, cx: i32, cz: i32) -> CityChunk {
     let (bx, bz) = block_world_span(params);
     let (sx, sz) = chunk_world_span(params);
-
     let chunk_org_x = cx as f32 * sx;
     let chunk_org_z = cz as f32 * sz;
-
     let mut rng = XorShift64::new(params.seed ^ hash2(cx, cz));
 
     let mut buildings = Vec::with_capacity(
@@ -319,14 +314,10 @@ pub fn generate_city_chunk(params: &CityGenParams, cx: i32, cz: i32) -> CityChun
         for bzi in 0..params.blocks_per_chunk_z {
             let major_x = params.major_every > 0 && (bxi % params.major_every == 0);
             let major_z = params.major_every > 0 && (bzi % params.major_every == 0);
-            // leave corridors empty for boulevards
             if major_x || major_z { continue; }
 
-            // Block origin (SW) inside this chunk
             let mut block_x = -0.5*sx + bxi as f32 * bx + params.road_w_minor * 0.5;
             let mut block_z = -0.5*sz + bzi as f32 * bz + params.road_w_minor * 0.5;
-
-            // Shift inward if there was a major corridor before this block
             if (bxi % params.major_every) > 0 && ((bxi / params.major_every) > 0) {
                 block_x += (params.road_w_major - params.road_w_minor) * ((bxi / params.major_every) as f32);
             }
@@ -343,7 +334,7 @@ pub fn generate_city_chunk(params: &CityGenParams, cx: i32, cz: i32) -> CityChun
                     let pick = rng.unit_f32();
                     let kind = if pick < w_low {
                         BuildingKind::Lowrise
-                    } else if pick < (w_low + 0.8) { // keep pyramids rarer
+                    } else if pick < (w_low + 0.8) {
                         BuildingKind::Highrise
                     } else {
                         BuildingKind::Pyramid
@@ -354,18 +345,21 @@ pub fn generate_city_chunk(params: &CityGenParams, cx: i32, cz: i32) -> CityChun
                     let sy = match kind {
                         BuildingKind::Lowrise  => 0.8 + 0.7 * rng.unit_f32(),
                         BuildingKind::Highrise => {
-                            // center boost
                             let boost = (1.0 + 1.2 * (1.0 - (x.hypot(z) / 1000.0)).clamp(0.0, 1.0));
                             (0.8 + 1.7 * rng.unit_f32()) * boost
                         }
                         BuildingKind::Pyramid  => 0.8 + 0.8 * rng.unit_f32(),
                     };
 
-                    let (model_near_mid, center, half, model_far) =
-                        place_models_and_aabb(kind, sx, sy, sz, x, z);
+                    // center.y is the vertical center (for AABB + rendering)
+                    let base_half = base_half_for(kind);
+                    let half_y = base_half.y * sy;
+                    let center_y = half_y;
 
-                    buildings.push(GeneratedBuilding {
-                        model_near_mid, model_far, center, half, kind
+                    buildings.push(BuildingRecord {
+                        pos_center: Vector3::new(x, center_y, z),
+                        scale:      Vector3::new(sx, sy, sz),
+                        kind,
                     });
                 }
             }

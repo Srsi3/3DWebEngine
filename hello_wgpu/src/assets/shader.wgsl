@@ -1,38 +1,33 @@
 struct Camera {
-    viewProj : mat4x4<f32>,
+    view_proj : mat4x4<f32>,
 };
+@group(0) @binding(0) var<uniform> uCamera : Camera;
 
-@group(0) @binding(0)
-var<uniform> uCamera : Camera;
-
-struct VsIn {
+struct VSIn {
     @location(0) position : vec3<f32>,
     @location(1) color    : vec4<f32>,
-    // Per-instance model matrix (4x vec4)
-    @location(2) i_m0     : vec4<f32>,
-    @location(3) i_m1     : vec4<f32>,
-    @location(4) i_m2     : vec4<f32>,
-    @location(5) i_m3     : vec4<f32>,
+
+    // per-instance
+    @location(2) inst_pos   : vec4<f32>, // pos.xyz
+    @location(3) inst_scale : vec4<f32>, // scale.xyz
 };
 
-struct VsOut {
+struct VSOut {
     @builtin(position) pos : vec4<f32>,
-    @location(0) color     : vec4<f32>,
+    @location(0) color : vec4<f32>,
 };
 
 @vertex
-fn vs_main(in: VsIn) -> VsOut {
-    var out : VsOut;
-
-    let model = mat4x4<f32>(in.i_m0, in.i_m1, in.i_m2, in.i_m3);
-    let world_pos = model * vec4<f32>(in.position, 1.0);
-
-    out.pos   = uCamera.viewProj * world_pos;
+fn vs_main(in: VSIn) -> VSOut {
+    // Scale around origin, then translate by center
+    let world_pos = in.inst_pos.xyz + in.inst_scale.xyz * in.position;
+    var out : VSOut;
+    out.pos   = uCamera.view_proj * vec4<f32>(world_pos, 1.0);
     out.color = in.color;
     return out;
 }
 
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     return in.color;
 }

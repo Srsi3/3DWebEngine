@@ -1,6 +1,5 @@
-use wgpu::util::DeviceExt;
 use crate::mesh;
-use crate::types::{CameraUniform, InstanceRaw, instance_buffer_layout, mat4_to_array};
+use crate::types::{CameraUniform, InstanceRaw, instance_buffer_layout};
 
 pub struct Engine {
     pub device: wgpu::Device,
@@ -38,7 +37,7 @@ pub struct Engine {
     instbuf_lod1_pyramid:  wgpu::Buffer,
     instbuf_lod2_billboard: wgpu::Buffer,
 
-    // draw counts (updated by update_instances)
+    // draw counts
     pub cnt_lod0_lowrise:  u32,
     pub cnt_lod0_highrise: u32,
     pub cnt_lod0_pyramid:  u32,
@@ -48,18 +47,16 @@ pub struct Engine {
     pub cnt_lod2_billboard: u32,
 }
 
-// ---- helper: grow buffer capacity without borrowing `self` ----
+// helper: grow buffer without borrowing self twice
 fn ensure_buf_capacity(
     device: &wgpu::Device,
     buf: &mut wgpu::Buffer,
     needed_instances: usize,
     label: &str,
 ) {
-    let needed_bytes = (needed_instances.max(1) * std::mem::size_of::<InstanceRaw>()) as u64;
-    if needed_bytes <= buf.size() {
-        return;
-    }
-    // grow ~1.5x to reduce realloc frequency
+    let elem = std::mem::size_of::<InstanceRaw>() as u64;
+    let needed_bytes = (needed_instances.max(1) as u64) * elem;
+    if needed_bytes <= buf.size() { return; }
     let new_bytes = (needed_bytes as f32 * 1.5).ceil() as u64;
     let newb = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(&format!("{label} (grown)")),
@@ -156,7 +153,7 @@ impl Engine {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[mesh::Vertex::layout(), instance_buffer_layout()],
+                buffers: &[mesh::Vertex::layout(), crate::types::instance_buffer_layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -187,7 +184,7 @@ impl Engine {
         // Instance buffers (start small; will grow automatically)
         let mk = |label| device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
-            size: std::mem::size_of::<InstanceRaw>() as u64, // 1 instance to start
+            size: std::mem::size_of::<InstanceRaw>() as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -229,7 +226,6 @@ impl Engine {
         self.config.width  = new_size.width;
         self.config.height = new_size.height;
         self.surface.configure(&self.device, &self.config);
-        // recreate depth
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth"),
             size: wgpu::Extent3d { width: new_size.width, height: new_size.height, depth_or_array_layers: 1 },
@@ -243,7 +239,12 @@ impl Engine {
     }
 
     pub fn update_camera(&self, vp: &cgmath::Matrix4<f32>) {
-        let data = CameraUniform { view_proj: mat4_to_array(vp) };
+        let data = CameraUniform { view_proj: [
+            [vp.x.x, vp.x.y, vp.x.z, vp.x.w],
+            [vp.y.x, vp.y.y, vp.y.z, vp.y.w],
+            [vp.z.x, vp.z.y, vp.z.z, vp.z.w],
+            [vp.w.x, vp.w.y, vp.w.z, vp.w.w],
+        ]};
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&data));
     }
 
@@ -254,7 +255,6 @@ impl Engine {
         v2_bill: &[InstanceRaw],
         ground: &InstanceRaw,
     ) {
-        // ---- grow buffers if needed (NO &mut self receiver involved) ----
         ensure_buf_capacity(&self.device, &mut self.instbuf_lod0_lowrise,  v0_low.len(),  "instbuf_lod0_lowrise");
         ensure_buf_capacity(&self.device, &mut self.instbuf_lod0_highrise, v0_high.len(), "instbuf_lod0_highrise");
         ensure_buf_capacity(&self.device, &mut self.instbuf_lod0_pyramid,  v0_pyr.len(),  "instbuf_lod0_pyramid");
@@ -263,7 +263,6 @@ impl Engine {
         ensure_buf_capacity(&self.device, &mut self.instbuf_lod1_pyramid,  v1_pyr.len(),  "instbuf_lod1_pyramid");
         ensure_buf_capacity(&self.device, &mut self.instbuf_lod2_billboard, v2_bill.len(),"instbuf_lod2_billboard");
 
-        // ---- upload data ----
         self.queue.write_buffer(&self.ground_instbuf, 0, bytemuck::bytes_of(ground));
         if !v0_low.is_empty()  { self.queue.write_buffer(&self.instbuf_lod0_lowrise,  0, bytemuck::cast_slice(v0_low)); }
         if !v0_high.is_empty() { self.queue.write_buffer(&self.instbuf_lod0_highrise, 0, bytemuck::cast_slice(v0_high)); }
