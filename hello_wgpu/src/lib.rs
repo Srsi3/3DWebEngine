@@ -2,6 +2,7 @@ use wasm_bindgen::prelude::*;
 pub mod hello_wgpu;
 pub mod mesh;
 pub mod camera;
+pub mod culling;
 pub use hello_wgpu::run; 
 cfg_if::cfg_if! {
   if #[cfg(target_arch = "wasm32")] {

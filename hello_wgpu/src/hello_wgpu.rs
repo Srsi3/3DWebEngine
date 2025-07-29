@@ -2,7 +2,8 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
 use std::time::Duration;
 
 use bytemuck::{Pod, Zeroable};
-use cgmath::{Matrix4, SquareMatrix, Vector3}; // SquareMatrix gives Matrix4::identity()
+// SquareMatrix gives Matrix4::identity()
+use cgmath::{Matrix4, SquareMatrix, Vector3, EuclideanSpace, InnerSpace};
 use instant::Instant;
 use log::{trace, debug, info, warn, error};
 use wgpu::util::DeviceExt;
@@ -25,6 +26,7 @@ use winit::platform::web::WindowAttributesExtWebSys;
 
 use crate::camera;
 use crate::mesh;
+use crate::culling;
 
 // -------- Uniforms & Instances ----------
 
@@ -32,6 +34,13 @@ use crate::mesh;
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+}
+
+#[derive(Copy, Clone)]
+struct WorldInstanceCPU {
+    model: Matrix4<f32>,
+    center: Vector3<f32>,
+    half: Vector3<f32>,
 }
 
 // Pad the uniform buffer allocation to 256 bytes for maximum backend compatibility.
@@ -121,6 +130,15 @@ impl Engine {
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&data));
     }
 
+    // NEW: allow per-frame compaction of visible instances
+    fn update_instances(&mut self, visible: &[InstanceRaw]) {
+        let bytes = bytemuck::cast_slice(visible);
+        if !bytes.is_empty() {
+            self.queue.write_buffer(&self.instance_buf, 0, bytes);
+        }
+        self.instance_count = visible.len() as u32;
+    }
+
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         trace!("render: acquiring current texture");
         let frame = self.surface.get_current_texture()?;
@@ -140,7 +158,7 @@ impl Engine {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.05, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.02, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -219,6 +237,9 @@ struct App {
     pending_gpu: Arc<Mutex<Option<(wgpu::Device, wgpu::Queue)>>>,
     pending_adapter: Arc<Mutex<Option<wgpu::Adapter>>>,
     instance: Option<wgpu::Instance>,
+
+    // CPU-side instances for culling/LOD
+    cpu_instances: Vec<WorldInstanceCPU>,
 }
 
 impl App {
@@ -238,6 +259,7 @@ impl App {
             pending_gpu: Arc::new(Mutex::new(None)),
             pending_adapter: Arc::new(Mutex::new(None)),
             instance: None,
+            cpu_instances: Vec::new(),
         }
     }
 
@@ -433,19 +455,22 @@ impl App {
         let cube_mesh = mesh::create_cube(&device);
         info!("Cube mesh buffers ready (indices: {})", cube_mesh.index_count);
 
-        // Grid of instances (10x10)
-        let grid = 10usize;
+        // NEW: Build CPU + GPU instance data together
+        // Increase grid: culling will keep it fast.
+        let grid = 64usize;
+        let mut cpu_instances = Vec::with_capacity(grid * grid);
         let mut instance_data = Vec::with_capacity(grid * grid);
+        let half = Vector3::new(0.5, 0.5, 0.5); // cube half-extents
+
         for x in 0..grid {
             for z in 0..grid {
-                let model = Matrix4::<f32>::from_translation(Vector3::new(
-                    (x as f32) * 2.5,
-                    0.0,
-                    (z as f32) * 2.5,
-                ));
+                let pos = Vector3::new((x as f32) * 2.5, 0.0, (z as f32) * 2.5);
+                let model = Matrix4::<f32>::from_translation(pos);
+                cpu_instances.push(WorldInstanceCPU { model, center: pos, half });
                 instance_data.push(InstanceRaw { model: mat4_to_array(&model) });
             }
         }
+
         let instance_count = instance_data.len() as u32;
         let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Instance Buffer"),
@@ -474,6 +499,10 @@ impl App {
         engine.resize(size);
 
         self.engine = Some(engine);
+
+        // NEW: store CPU copies for culling/LOD
+        self.cpu_instances = cpu_instances;
+
         info!("finalize_engine: done");
     }
 }
@@ -647,6 +676,27 @@ impl ApplicationHandler for App {
                         let aspect = (size.width.max(1) as f32) / (size.height.max(1) as f32);
                         let vp = self.camera.view_projection(aspect);
                         engine.update_camera(&vp);
+
+                        // NEW: CPU culling + simple distance LOD
+                        // Tune as desired:
+                        const LOD0_MAX: f32 = 120.0;  // draw up to 120 m
+                        const CULL_MAX: f32 = 300.0;  // never draw beyond 300 m
+
+                        let fr = culling::frustum_from_vp(&vp);
+                        let cam_pos = self.camera.position.to_vec();
+
+                        let mut visible: Vec<InstanceRaw> = Vec::with_capacity(self.cpu_instances.len());
+                        for inst in &self.cpu_instances {
+                            let dist = (inst.center - cam_pos).magnitude();
+                            if dist > CULL_MAX { continue; }
+                            if dist > LOD0_MAX { continue; }        // simple LOD: skip mid/far for now
+                            if !culling::aabb_intersects_frustum(inst.center, inst.half, &fr) { continue; }
+
+                            visible.push(InstanceRaw { model: mat4_to_array(&inst.model) });
+                        }
+
+                        engine.update_instances(&visible);
+                        trace!("CULL: visible={} / total={}", visible.len(), self.cpu_instances.len());
 
                         match engine.render() {
                             Ok(()) => {}
