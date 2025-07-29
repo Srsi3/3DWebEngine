@@ -57,7 +57,6 @@ fn mat4_to_array(m: &Matrix4<f32>) -> [[f32; 4]; 4] {
 fn init_logging(is_web: bool) {
     #[cfg(target_arch = "wasm32")]
     {
-        // Log to browser console; default to info if no RUST_LOG given.
         let _ = console_log::init_with_level(log::Level::Info);
         #[cfg(feature = "console-panic-hook")]
         console_error_panic_hook::set_once();
@@ -253,7 +252,6 @@ impl App {
             .await
             .unwrap();
 
-        // Log uncaptured wgpu errors (validation, etc.)
         device.on_uncaptured_error(Box::new(|e| {
             error!("WGPU Uncaptured Error: {e:?}");
         }));
@@ -267,12 +265,10 @@ impl App {
     }
 
     fn instance_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
-        // 4 x vec4<f32> rows (64 bytes)
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &[
-                // shader locations 2..5 must match WGSL
                 wgpu::VertexAttribute { shader_location: 2, offset: 0,  format: wgpu::VertexFormat::Float32x4 },
                 wgpu::VertexAttribute { shader_location: 3, offset: 16, format: wgpu::VertexFormat::Float32x4 },
                 wgpu::VertexAttribute { shader_location: 4, offset: 32, format: wgpu::VertexFormat::Float32x4 },
@@ -282,6 +278,9 @@ impl App {
     }
 
     fn finalize_engine(&mut self) {
+        // These traces help confirm finalize timing:
+        trace!("finalize_engine: called, ready_flag={}", self.engine_ready.load(Ordering::SeqCst));
+
         if self.engine.is_some() {
             trace!("finalize_engine: already created");
             return;
@@ -594,6 +593,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+        // Keep asking for redraws — this drives the render loop.
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -631,7 +631,6 @@ impl ApplicationHandler for App {
                     self.last_cursor_pos = Some(position);
                 }
             }
-            _ => {},
             WindowEvent::Resized(size) => {
                 info!("Window resized: {}x{}", size.width, size.height);
                 if let Some(engine) = self.engine.as_mut() {
@@ -639,6 +638,7 @@ impl ApplicationHandler for App {
                 }
             },
             WindowEvent::RedrawRequested => {
+                trace!("RedrawRequested");
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_frame_time).as_secs_f32();
                 if dt >= 0.016 { // ~60 FPS limiter
@@ -648,6 +648,7 @@ impl ApplicationHandler for App {
                     self.finalize_engine();
 
                     if let Some(engine) = self.engine.as_mut() {
+                        // Compute VP and upload to the uniform
                         let size = self.window.as_ref().unwrap().inner_size();
                         let aspect = (size.width.max(1) as f32) / (size.height.max(1) as f32);
                         let vp = self.camera.view_projection(aspect);
@@ -680,7 +681,7 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            _ => (),
+            _ => {} // << keep the catch‑all ONLY here, at the end
         }
     }
 }
