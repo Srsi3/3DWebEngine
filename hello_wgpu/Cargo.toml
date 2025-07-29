@@ -18,7 +18,7 @@ pollster = "0.3"          # tiny async executor for native
 cfg-if   = "1.0"
 console_error_panic_hook = { version = "0.1", optional = true }
 web-sys = { version = "0.3", features = ["Document","Window", "Element",]}
-
+bytemuck = { version = "1.14", features = ["derive"] }
 instant = { version = "0.1.12", features = ["wasm-bindgen"] }
 cgmath = "0.18.0"
 
