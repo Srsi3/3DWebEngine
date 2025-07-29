@@ -1,99 +1,133 @@
-use cgmath::{Vector3, Quaternion, Deg};
+use std::collections::HashSet;
 
-struct Camera {
-    position: Vector3<f32>,
-    rotation: Quaternion<f32>,
-    forward: Vector3<f32>,  // Direction the camera is facing
-    right: Vector3<f32>,    // Right direction (for strafing)
-    up: Vector3<f32>,       // Up direction
-    speed: f32,             // Movement speed
+use cgmath::{
+    Deg, InnerSpace, Matrix4, Point3, Vector3,
+    perspective,
+};
+use winit::keyboard::KeyCode;
+
+pub struct KeyboardInput {
+    pressed: HashSet<KeyCode>,
 }
+
+impl KeyboardInput {
+    pub fn new() -> Self {
+        Self { pressed: HashSet::new() }
+    }
+    pub fn key_press(&mut self, code: KeyCode)   { self.pressed.insert(code); }
+    pub fn key_release(&mut self, code: KeyCode) { self.pressed.remove(&code); }
+    pub fn is_pressed(&self, code: KeyCode) -> bool { self.pressed.contains(&code) }
+}
+
+pub struct Camera {
+    pub position: Point3<f32>,
+    pub forward:  Vector3<f32>,
+    pub right:    Vector3<f32>,
+    pub up:       Vector3<f32>,
+    pub speed:    f32,   // movement units per second
+    pub yaw:      f32,   // radians, left/right
+    pub pitch:    f32,   // radians, up/down (clamped)
+}
+
 impl Camera {
-    fn new() -> Self {
-        Camera {
-            position: Vector3::new(0.0, 5.0, -10.0),
-            rotation: Quaternion::from_angle_y(Deg(0.0)),
-            forward: Vector3::new(0.0, 0.0, 1.0),
-            right: Vector3::new(1.0, 0.0, 0.0),
-            up: Vector3::new(0.0, 1.0, 0.0),
+    pub fn new() -> Self {
+        // Start at +Z forward. If you want -Z forward, set forward.z = -1.0 and yaw = PI.
+        let position = Point3::new(0.0, 5.0, -10.0);
+        let forward  = Vector3::new(0.0, 0.0, 1.0).normalize();
+        let up       = Vector3::new(0.0, 1.0, 0.0);
+        let right    = forward.cross(up).normalize();
+
+        Self {
+            position,
+            forward,
+            right,
+            up,
             speed: 5.0,
+            yaw:   0.0,
+            pitch: 0.0,
         }
     }
 
-    fn update(&mut self, delta_time: f32, input: &KeyboardInput) {
-        let movement_speed = self.speed * delta_time;
+    /// Apply mouse delta (in pixels) to yaw/pitch. Call from WindowEvent::CursorMoved.
+    pub fn process_mouse_delta(&mut self, delta_x: f32, delta_y: f32, sensitivity: f32) {
+        // Typical: add yaw with +dx, subtract pitch with +dy (so moving mouse up looks up)
+        self.yaw   += delta_x * sensitivity;
+        self.pitch -= delta_y * sensitivity;
+        self.clamp_pitch();
+        self.update_axes_from_angles();
+    }
 
-        if input.is_key_pressed(VirtualKeyCode::W) {
-            self.position += self.forward * movement_speed;
+    /// Update per-frame: handle rotation keys, then move.
+    /// `delta_time` is seconds since last frame.
+    pub fn update(&mut self, delta_time: f32, input: &KeyboardInput) {
+        // ----- Rotation via keyboard (optional, for testing without mouse) -----
+        let rot_speed = 1.5; // radians/sec
+        if input.is_pressed(KeyCode::ArrowLeft)  { self.yaw   -= rot_speed * delta_time; }
+        if input.is_pressed(KeyCode::ArrowRight) { self.yaw   += rot_speed * delta_time; }
+        if input.is_pressed(KeyCode::ArrowUp)    { self.pitch -= rot_speed * delta_time; }
+        if input.is_pressed(KeyCode::ArrowDown)  { self.pitch += rot_speed * delta_time; }
+
+        self.clamp_pitch();
+        self.update_axes_from_angles();
+
+        // ----- Movement along the rotated axes -----
+        let movement = self.speed * delta_time;
+
+        if input.is_pressed(KeyCode::KeyW) { self.position += self.forward * movement; }
+        if input.is_pressed(KeyCode::KeyS) { self.position -= self.forward * movement; }
+        if input.is_pressed(KeyCode::KeyA) { self.position -= self.right   * movement; }
+        if input.is_pressed(KeyCode::KeyD) { self.position += self.right   * movement; }
+
+        // Vertical (noclip) movement
+        if input.is_pressed(KeyCode::Space) {
+            self.position += self.up * movement;
         }
-        if input.is_key_pressed(VirtualKeyCode::S) {
-            self.position -= self.forward * movement_speed;
-        }
-        if input.is_key_pressed(VirtualKeyCode::A) {
-            self.position -= self.right * movement_speed;
-        }
-        if input.is_key_pressed(VirtualKeyCode::D) {
-            self.position += self.right * movement_speed;
+        if input.is_pressed(KeyCode::ShiftLeft) || input.is_pressed(KeyCode::ShiftRight) {
+            self.position -= self.up * movement;
         }
     }
 
-    fn get_view_matrix(&self) -> cgmath::Matrix4<f32> {
-        cgmath::Matrix4::look_at_rh(self.position, self.position + self.forward, self.up)
+    /// View matrix (right-handed). `look_at_rh` expects `Point3` for eye/center, `Vector3` for up.
+    pub fn view_matrix(&self) -> Matrix4<f32> {
+        Matrix4::look_at_rh(self.position, self.position + self.forward, self.up)
     }
-    
-    fn get_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
-        self.projection_matrix * self.view_matrix
+
+    /// Basic perspective projection. Pass your swapchain aspect (width/height).
+    pub fn projection_matrix(&self, aspect: f32) -> Matrix4<f32> {
+        perspective(Deg(60.0), aspect, 0.1, 1_000.0)
+    }
+
+    /// Combined view-projection matrix.
+    pub fn view_projection(&self, aspect: f32) -> Matrix4<f32> {
+        self.projection_matrix(aspect) * self.view_matrix()
+    }
+
+    // --- internals ---
+
+    fn clamp_pitch(&mut self) {
+        // Prevent gimbal flip; ~±89° is common
+        let limit = 89.0_f32.to_radians();
+        if self.pitch >  limit { self.pitch =  limit; }
+        if self.pitch < -limit { self.pitch = -limit; }
+    }
+
+    fn update_axes_from_angles(&mut self) {
+        // Forward from yaw/pitch (right-handed, +Z forward at yaw=0).
+        // If you want -Z forward at yaw=0, use x =  cos(yaw)*cos(pitch), z = -sin(yaw)*cos(pitch)
+        let cy = self.yaw.cos();
+        let sy = self.yaw.sin();
+        let cp = self.pitch.cos();
+        let sp = self.pitch.sin();
+
+        self.forward = Vector3::new(cy * cp, sp, sy * cp).normalize();
+
+        // Derive right and up to keep an orthonormal basis
+        self.right = self.forward.cross(Vector3::unit_y()).normalize();
+        self.up    = self.right.cross(self.forward).normalize();
     }
 }
 
-
-//render code for the camera need to reformat for main code block
-fn render(&mut self, meshes: &Vec<(Mesh, cgmath::Matrix4<f32>)>, camera: &Camera) {
-    let frame = self.surface.get_current_texture().unwrap();
-    let view_proj = camera.get_view_projection_matrix();
-
-    let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Render Encoder") });
-
-    for (mesh, translation) in meshes {
-        // Create the model-view matrix for each mesh (combining its translation with the camera's view matrix)
-        let model_view = view_proj * translation;
-
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &frame.texture.create_view(&wgpu::TextureViewDescriptor::default()),
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-        });
-
-        rpass.set_pipeline(&self.render_pipeline);
-        rpass.set_vertex_buffer(0, &mesh.vertex_buffer, 0, 0);
-        rpass.set_index_buffer(&mesh.index_buffer, 0, 0);
-        rpass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
-    }
-
-    self.queue.submit(Some(encoder.finish()));
-    frame.present();
+/// Distance-based culling helper
+pub fn should_render(building_pos: Point3<f32>, camera_pos: Point3<f32>, max_distance: f32) -> bool {
+    (building_pos - camera_pos).magnitude() < max_distance
 }
-
-fn should_render(building_position: cgmath::Vector3<f32>, camera_position: cgmath::Vector3<f32>, max_distance: f32) -> bool {
-    (building_position - camera_position).magnitude() < max_distance
-}
-// //copilot generated code to render visible buildings based on distance from camera -- not sure if this is the best way to do it
-// fn render_visible_buildings(&mut self, meshes: &Vec<(Mesh, cgmath::Matrix4<f32>)>, camera: &Camera) {
-//     let max_distance = 50.0; // Adjust based on your needs
-//     let camera_position = camera.position;
-
-//     for (mesh, translation) in meshes {
-//         let building_position = translation.w.truncate(); // Extract position from the translation matrix
-
-//         if should_render(building_position, camera_position, max_distance) {
-//             self.render(mesh, translation);
-//         }
-//     }
-// }
