@@ -7,7 +7,8 @@ pub mod types;
 pub mod render;
 pub mod chunking;
 pub mod city_store;
-
+pub mod assets;
+pub mod designer_ml;
 pub use hello_wgpu::run; 
 cfg_if::cfg_if! {
   if #[cfg(target_arch = "wasm32")] {

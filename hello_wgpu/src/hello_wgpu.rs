@@ -27,7 +27,9 @@ use crate::culling;
 use crate::mesh;
 use crate::types::InstanceRaw;
 use crate::render::Engine;
-use crate::chunking::ChunkManager;
+use crate::chunking::{ChunkManager, ViewerId};
+use crate::assets::BuildingCategory;
+use crate::designer_ml::{RuleDesigner, CityDesigner};
 
 // -------- logging --------
 
@@ -87,6 +89,8 @@ struct App {
 
     // chunking + finite world
     chunk_mgr: ChunkManager,
+    viewer_id: ViewerId,
+    designer: RuleDesigner,
 
     // ground
     ground_model: InstanceRaw,
@@ -116,7 +120,6 @@ impl App {
         };
 
         // Finite world bounds (inclusive chunk coords).
-        // Example: a 9×9 chunk world centered at 0 => [-4..=4]
         let bounds = (-4, 4, -4, 4);
         let bake_on_miss = true;
 
@@ -124,6 +127,8 @@ impl App {
             params, 3, bounds, bake_on_miss,
             "./city_chunks" // native dir; web uses localStorage instead
         );
+
+        let viewer_id: ViewerId = 1;
 
         Self {
             is_web,
@@ -137,6 +142,8 @@ impl App {
             pending_adapter: Arc::new(Mutex::new(None)),
             instance: None,
             chunk_mgr,
+            viewer_id,
+            designer: RuleDesigner { params },
             ground_model: InstanceRaw { pos: [0.0, -0.05, 0.0, 0.0], scale: [1.0, 1.0, 1.0, 0.0] },
             world_origin: cgmath::Vector3::new(0.0, 0.0, 0.0),
             lod0_max: 90.0, lod1_max: 190.0, cull_max: 380.0,
@@ -310,7 +317,7 @@ impl ApplicationHandler for App {
                             Digit6 => { self.cull_max += 20.0; info!("CULL_MAX => {:.1}", self.cull_max); }
                             BracketLeft  => { self.chunk_mgr.chunk_radius = (self.chunk_mgr.chunk_radius - 1).max(1); info!("Chunk radius => {}", self.chunk_mgr.chunk_radius); }
                             BracketRight => { self.chunk_mgr.chunk_radius = (self.chunk_mgr.chunk_radius + 1).min(8); info!("Chunk radius => {}", self.chunk_mgr.chunk_radius); }
-                            KeyR => { // reseed & clear store (only in-bounds when visiting will be re-saved)
+                            KeyR => { // reseed & clear loaded (store persists)
                                 self.chunk_mgr.params.seed ^= (Instant::now().elapsed().as_nanos() as u64);
                                 self.chunk_mgr.loaded.clear();
                                 info!("World reseeded; chunks cleared (store not cleared).");
@@ -349,11 +356,12 @@ impl ApplicationHandler for App {
                     self.finalize_engine();
 
                     if let Some(engine) = self.engine.as_mut() {
-                        // ensure chunks in bounds (and bake/load)
-                        let shift = cgmath::Vector3::new(
-                            self.world_origin.x as f32, self.world_origin.y as f32, self.world_origin.z as f32
-                        );
-                        self.chunk_mgr.ensure_for_camera(self.camera.position.x, self.camera.position.z, shift);
+                        // ---- everything stays INSIDE this single &mut borrow of engine ----
+                        let assets = engine.assets_ref();
+
+                        // ensure chunks for camera (multiplayer-friendly path)
+                        self.chunk_mgr.set_viewer(self.viewer_id, self.camera.position.x, self.camera.position.z);
+                        self.chunk_mgr.ensure_for_viewers(&mut self.designer, assets);
 
                         // VP
                         let size = self.window.as_ref().unwrap().inner_size();
@@ -375,43 +383,43 @@ impl ApplicationHandler for App {
 
                         let mut stats_visible = 0usize;
                         for list in self.chunk_mgr.loaded.values() {
-                            for b in list {
-                                let dist = (b.pos_center - cam_pos).magnitude();
+                            for p in list {
+                                let dist = (p.center - cam_pos).magnitude();
                                 if dist > self.cull_max { continue; }
 
-                                let base_half = mesh::base_half_for(b.kind);
+                                let base_half = assets.base_half(p.archetype_id as usize);
                                 let half = cgmath::Vector3::new(
-                                    base_half.x * b.scale.x,
-                                    base_half.y * b.scale.y,
-                                    base_half.z * b.scale.z,
+                                    base_half.x * p.scale.x,
+                                    base_half.y * p.scale.y,
+                                    base_half.z * p.scale.z,
                                 );
-                                if !culling::aabb_intersects_frustum(b.pos_center, half, &fr) { continue; }
+                                if !culling::aabb_intersects_frustum(p.center, half, &fr) { continue; }
                                 stats_visible += 1;
 
                                 if dist <= self.lod0_max {
                                     let raw = InstanceRaw {
-                                        pos:   [b.pos_center.x, b.pos_center.y, b.pos_center.z, 0.0],
-                                        scale: [b.scale.x,      b.scale.y,      b.scale.z,      0.0],
+                                        pos:   [p.center.x, p.center.y, p.center.z, 0.0],
+                                        scale: [p.scale.x,  p.scale.y,  p.scale.z,  0.0],
                                     };
-                                    match b.kind {
-                                        mesh::BuildingKind::Lowrise  => v0_low.push(raw),
-                                        mesh::BuildingKind::Highrise => v0_high.push(raw),
-                                        mesh::BuildingKind::Pyramid  => v0_pyr.push(raw),
+                                    match assets.category_of(p.archetype_id as usize) {
+                                        BuildingCategory::Lowrise  => v0_low.push(raw),
+                                        BuildingCategory::Highrise => v0_high.push(raw),
+                                        BuildingCategory::Landmark => v0_pyr.push(raw),
                                     }
                                 } else if dist <= self.lod1_max {
                                     let raw = InstanceRaw {
-                                        pos:   [b.pos_center.x, b.pos_center.y, b.pos_center.z, 0.0],
-                                        scale: [b.scale.x,      b.scale.y,      b.scale.z,      0.0],
+                                        pos:   [p.center.x, p.center.y, p.center.z, 0.0],
+                                        scale: [p.scale.x,  p.scale.y,  p.scale.z,  0.0],
                                     };
-                                    match b.kind {
-                                        mesh::BuildingKind::Lowrise  => v1_low.push(raw),
-                                        mesh::BuildingKind::Highrise => v1_high.push(raw),
-                                        mesh::BuildingKind::Pyramid  => v1_pyr.push(raw),
+                                    match assets.category_of(p.archetype_id as usize) {
+                                        BuildingCategory::Lowrise  => v1_low.push(raw),
+                                        BuildingCategory::Highrise => v1_high.push(raw),
+                                        BuildingCategory::Landmark => v1_pyr.push(raw),
                                     }
                                 } else {
                                     // billboard footprint from half
                                     let raw = InstanceRaw {
-                                        pos:   [b.pos_center.x, b.pos_center.y, b.pos_center.z, 0.0],
+                                        pos:   [p.center.x, p.center.y, p.center.z, 0.0],
                                         scale: [half.x.max(0.5), (half.y*2.0).max(0.5), 1.0, 0.0],
                                     };
                                     v2_bill.push(raw);

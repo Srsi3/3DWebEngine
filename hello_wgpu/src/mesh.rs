@@ -258,7 +258,7 @@ pub struct CityGenParams {
     pub seed: u64,
 }
 
-fn block_world_span(params: &CityGenParams) -> (f32, f32) {
+pub(crate) fn block_world_span(params: &CityGenParams) -> (f32, f32) {
     let span_x = params.lots_x as f32 * (params.lot_w + params.lot_gap) - params.lot_gap;
     let span_z = params.lots_z as f32 * (params.lot_d + params.lot_gap) - params.lot_gap;
     let bx = span_x + params.road_w_minor;

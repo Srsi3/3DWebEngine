@@ -1,5 +1,6 @@
 use crate::mesh;
 use crate::types::{CameraUniform, InstanceRaw, instance_buffer_layout};
+use crate::assets::{AssetLibrary, BuildingCategory};
 
 pub struct Engine {
     pub device: wgpu::Device,
@@ -20,7 +21,7 @@ pub struct Engine {
     camera_bg:  wgpu::BindGroup,
     camera_buf: wgpu::Buffer,
 
-    // city meshes
+    // city meshes (bucketed by category)
     pub mesh_lowrise:   mesh::Mesh,
     pub mesh_highrise:  mesh::Mesh,
     pub mesh_pyramid:   mesh::Mesh,
@@ -45,6 +46,9 @@ pub struct Engine {
     pub cnt_lod1_highrise: u32,
     pub cnt_lod1_pyramid:  u32,
     pub cnt_lod2_billboard: u32,
+
+    // asset registry (for hello_wgpu to query base_half/category)
+    pub(crate) assets: AssetLibrary,
 }
 
 // helper: grow buffer without borrowing self twice
@@ -178,7 +182,7 @@ impl Engine {
             cache: None,
         });
 
-        // Meshes
+        // Meshes (per category)
         let city = mesh::create_city_meshes(&device);
 
         // Instance buffers (start small; will grow automatically)
@@ -196,6 +200,9 @@ impl Engine {
         let instbuf_lod1_high   = mk("instbuf_lod1_highrise");
         let instbuf_lod1_pyr    = mk("instbuf_lod1_pyramid");
         let instbuf_lod2_bill   = mk("instbuf_lod2_billboard");
+
+        // Asset library (used by the app for base_half/category mapping)
+        let assets = AssetLibrary::new(&device);
 
         Self {
             device, queue, surface, config,
@@ -218,8 +225,12 @@ impl Engine {
             cnt_lod0_lowrise: 0, cnt_lod0_highrise: 0, cnt_lod0_pyramid: 0,
             cnt_lod1_lowrise: 0, cnt_lod1_highrise: 0, cnt_lod1_pyramid: 0,
             cnt_lod2_billboard: 0,
+            assets,
         }
     }
+
+    #[inline]
+    pub fn assets_ref(&self) -> &AssetLibrary { &self.assets }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width == 0 || new_size.height == 0 { return; }
