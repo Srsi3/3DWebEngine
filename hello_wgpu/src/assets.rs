@@ -1,122 +1,140 @@
-//! Asset archetype registry.
-//! Keeps the engine lightweight by starting with built-in, vertex-colored meshes,
-//! while allowing optional glTF loading behind a Cargo feature later.
+//! Asset library – holds archetype metadata and the shared meshes that the
+//! renderer batches by category.  You can plug in real geometry later;
+//! the current placeholder meshes come from `mesh::*` helpers.
+
+use cgmath::Vector3;
 
 use crate::mesh;
 
-/// Batching category to keep draw calls low.
-/// You can extend this list if you add more pipelines/materials.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum BuildingCategory {
+// ───────────────────────── Categories & lookup ──────────────────────────
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BuildingCategory { Lowrise, Highrise, Landmark }
+
+/// Which shared draw-mesh the renderer uses (one VA per enum value)
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CategoryMesh {
     Lowrise,
     Highrise,
-    Landmark, // used for pyramid/unique types
+    Landmark,
+    Billboard,
+    Ground,
 }
 
-/// Half-extents (base footprint / height) at scale=1.
-/// Used for culling and billboard sizing.
-#[derive(Copy, Clone, Debug)]
-pub struct BaseHalf {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-}
-
-/// One building archetype with LODs and a billboard mesh.
+/// One archetype entry in the table
+#[derive(Clone)]
 pub struct Archetype {
-    pub name: String,
+    pub name: &'static str,
     pub category: BuildingCategory,
-    pub lod0: mesh::Mesh,
-    pub lod1: mesh::Mesh,
-    pub lod2: mesh::Mesh,
-    pub billboard: mesh::Mesh,
-    pub base_half: BaseHalf,
+    pub base_half: Vector3<f32>,          // for culling / billboard footprint
+    pub mesh: Option<mesh::Mesh>,         // None ⇒ use category rep mesh
+    pub rep_category_mesh: CategoryMesh,  // which shared VA to draw
 }
 
-/// Small registry of archetypes.
-/// Start with 3 built-in archetypes; add more later (or via optional glTF).
+// ───────────────────────── AssetLibrary struct ─────────────────────────
 pub struct AssetLibrary {
-    archetypes: Vec<Archetype>,
+    pub archetypes: Vec<Archetype>,
+    idx_lowrise:  Vec<usize>,
+    idx_highrise: Vec<usize>,
+    idx_landmark: Vec<usize>,
+
+    // shared meshes (one VA per category + billboard + ground)
+    pub mesh_lowrise:   mesh::Mesh,
+    pub mesh_highrise:  mesh::Mesh,
+    pub mesh_landmark:  mesh::Mesh,
+    pub mesh_billboard: mesh::Mesh,
+    pub mesh_ground:    mesh::Mesh,
 }
 
 impl AssetLibrary {
-    /// Create a default library using built-in meshes.
     pub fn new(device: &wgpu::Device) -> Self {
-        let builtins = crate::mesh::create_city_meshes(device);
+        // ---------- shared representative meshes ----------
+        let mesh_lowrise   = mesh::make_timber_gable(device);
+        let mesh_highrise  = mesh::make_block_tower(device);
+        let mesh_landmark  = mesh::make_pyramid(device);
+        let mesh_billboard = mesh::make_billboard(device);
+        let mesh_ground    = mesh::make_ground_plane(device, 512.0);
 
-        // NOTE: We create separate meshes for each archetype now to avoid Handle/Clone complexity.
-        // With few archetypes this is fine. If you later want to share buffers across archetypes,
-        // refactor Mesh into Arc<MeshInner>.
-        let lowrise = Archetype {
-            name: "lowrise_box".into(),
-            category: BuildingCategory::Lowrise,
-            lod0: crate::mesh::create_block_lowrise(device),
-            lod1: crate::mesh::create_block_lowrise(device),
-            lod2: crate::mesh::create_block_lowrise(device),
-            billboard: crate::mesh::create_billboard_quad(device),
-            base_half: BaseHalf { x: 1.5, y: 0.4, z: 1.0 },
+        // ---------- optional per-archetype mesh ----------
+        let timber_alt_mesh = mesh::make_timber_gable_alt(device);
+
+        // ---------- build archetype table ----------
+        let mut archetypes = Vec::<Archetype>::new();
+        let mut idx_low = Vec::<usize>::new();
+        let mut idx_high= Vec::<usize>::new();
+        let mut idx_land= Vec::<usize>::new();
+
+        // helper closure
+        let mut push = |name:&'static str,
+                        category:BuildingCategory,
+                        half:Vector3<f32>,
+                        mesh_opt:Option<mesh::Mesh>,
+                        rep:CategoryMesh,
+                        catlist:&mut Vec<usize>| {
+            archetypes.push(Archetype{ name, category, base_half:half,
+                                       mesh:mesh_opt, rep_category_mesh:rep});
+            catlist.push(archetypes.len()-1);
         };
 
-        let highrise = Archetype {
-            name: "highrise_box".into(),
-            category: BuildingCategory::Highrise,
-            lod0: crate::mesh::create_tower_highrise(device),
-            lod1: crate::mesh::create_tower_highrise(device),
-            lod2: crate::mesh::create_tower_highrise(device),
-            billboard: crate::mesh::create_billboard_quad(device),
-            base_half: BaseHalf { x: 0.45, y: 3.0, z: 0.45 },
-        };
+        // ---- Low-rise variants ----
+        let h_low = Vector3::new(0.9,0.9,0.9);
+        push("timber_house_a", BuildingCategory::Lowrise, h_low, None,
+             CategoryMesh::Lowrise, &mut idx_low);
+        push("timber_house_b", BuildingCategory::Lowrise, h_low,
+             Some(timber_alt_mesh), CategoryMesh::Lowrise, &mut idx_low);
+        push("workshop_neon" , BuildingCategory::Lowrise, h_low, None,
+             CategoryMesh::Lowrise, &mut idx_low);
 
-        let landmark = Archetype {
-            name: "pyramid_tower".into(),
-            category: BuildingCategory::Landmark,
-            lod0: crate::mesh::create_pyramid_tower(device),
-            lod1: crate::mesh::create_pyramid_tower(device),
-            lod2: crate::mesh::create_pyramid_tower(device),
-            billboard: crate::mesh::create_billboard_quad(device),
-            base_half: BaseHalf { x: 1.0, y: 0.75, z: 1.0 }, // approx base+roof
-        };
+        // ---- High-rise variants ----
+        let h_high = Vector3::new(0.7,1.6,0.7);
+        push("block_tower_a", BuildingCategory::Highrise, h_high, None,
+             CategoryMesh::Highrise, &mut idx_high);
+        push("block_tower_b", BuildingCategory::Highrise, h_high, None,
+             CategoryMesh::Highrise, &mut idx_high);
+        let h_cyl = Vector3::new(0.55,1.5,0.55);
+        push("cyl_tower_12", BuildingCategory::Highrise, h_cyl, None,
+             CategoryMesh::Highrise, &mut idx_high);
 
-        let mut lib = Self { archetypes: Vec::with_capacity(8) };
-        lib.archetypes.push(lowrise);
-        lib.archetypes.push(highrise);
-        lib.archetypes.push(landmark);
+        // ---- Landmarks ----
+        let h_pyr = Vector3::new(1.2,1.2,1.2);
+        push("pyramid_citadel", BuildingCategory::Landmark, h_pyr, None,
+             CategoryMesh::Landmark, &mut idx_land);
+        let h_gate = Vector3::new(1.1,1.1,0.8);
+        push("gate_arch", BuildingCategory::Landmark, h_gate, None,
+             CategoryMesh::Landmark, &mut idx_land);
 
-        // (Optional) Also keep a "ground" mesh in mesh.rs; not an archetype.
-        // builtins.ground is used by renderer directly.
-
-        lib
+        Self {
+            archetypes,
+            idx_lowrise:  idx_low,
+            idx_highrise: idx_high,
+            idx_landmark: idx_land,
+            mesh_lowrise, mesh_highrise, mesh_landmark, mesh_billboard, mesh_ground,
+        }
     }
 
-    #[inline]
-    pub fn len(&self) -> usize { self.archetypes.len() }
-
-    #[inline]
-    pub fn get(&self, idx: usize) -> &Archetype { &self.archetypes[idx] }
-
-    /// Find one archetype index for a requested category (random choice can be done externally).
-    pub fn any_index_by_category(&self, cat: BuildingCategory) -> Option<usize> {
-        self.archetypes.iter().enumerate().find(|(_, a)| a.category == cat).map(|(i,_)| i)
+    // ---------- quick lookups ----------
+    #[inline] pub fn base_half(&self, id: usize) -> Vector3<f32> {
+        self.archetypes[id].base_half
     }
-
-    /// Return all indices for a category (to randomly pick variants).
-    pub fn indices_by_category(&self, cat: BuildingCategory) -> Vec<usize> {
-        self.archetypes.iter().enumerate().filter_map(|(i,a)| (a.category==cat).then_some(i)).collect()
+    #[inline] pub fn category_of(&self, id: usize) -> BuildingCategory {
+        self.archetypes[id].category
     }
-
-    /// Access base half-extents for culling/billboards.
-    pub fn base_half(&self, idx: usize) -> BaseHalf {
-        self.archetypes[idx].base_half
+    #[inline] pub fn mesh_of(&self, id: usize) -> Option<&mesh::Mesh> {
+        self.archetypes[id].mesh.as_ref()
     }
-
-    /// Map an archetype id to a coarse category (useful for legacy code paths).
-    pub fn category_of(&self, idx: usize) -> BuildingCategory {
-        self.archetypes[idx].category
+    #[inline] pub fn indices_by_category(&self, cat: BuildingCategory) -> &[usize] {
+        match cat {
+            BuildingCategory::Lowrise  => &self.idx_lowrise,
+            BuildingCategory::Highrise => &self.idx_highrise,
+            BuildingCategory::Landmark => &self.idx_landmark,
+        }
     }
-
-    /// Access LOD meshes (used by the renderer set-up).
-    pub fn meshes_for(&self, idx: usize) -> (&mesh::Mesh, &mesh::Mesh, &mesh::Mesh, &mesh::Mesh) {
-        let a = &self.archetypes[idx];
-        (&a.lod0, &a.lod1, &a.lod2, &a.billboard)
+    #[inline] pub fn mesh_for(&self, cm: CategoryMesh) -> &mesh::Mesh {
+        match cm {
+            CategoryMesh::Lowrise   => &self.mesh_lowrise,
+            CategoryMesh::Highrise  => &self.mesh_highrise,
+            CategoryMesh::Landmark  => &self.mesh_landmark,
+            CategoryMesh::Billboard => &self.mesh_billboard,
+            CategoryMesh::Ground    => &self.mesh_ground,
+        }
     }
 }

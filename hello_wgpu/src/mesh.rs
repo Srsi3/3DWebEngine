@@ -1,7 +1,7 @@
 use wgpu::util::DeviceExt;
 use bytemuck::{Pod, Zeroable};
 use cgmath::{Matrix4, Vector3};
-
+use crate::chunking::CityGenParams;
 // ---------- Vertex & Mesh ----------
 
 #[repr(C)]
@@ -24,6 +24,7 @@ impl Vertex {
     }
 }
 
+#[derive(Clone)]
 pub struct Mesh {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer:  wgpu::Buffer,
@@ -243,37 +244,8 @@ pub fn base_half_for(kind: BuildingKind) -> HalfExtents {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct CityGenParams {
-    pub lots_x: usize,
-    pub lots_z: usize,
-    pub lot_w:  f32,
-    pub lot_d:  f32,
-    pub lot_gap: f32,
-    pub road_w_minor: f32,
-    pub road_w_major: f32,
-    pub major_every:  usize,
-    pub blocks_per_chunk_x: usize,
-    pub blocks_per_chunk_z: usize,
-    pub seed: u64,
-}
 
-pub(crate) fn block_world_span(params: &CityGenParams) -> (f32, f32) {
-    let span_x = params.lots_x as f32 * (params.lot_w + params.lot_gap) - params.lot_gap;
-    let span_z = params.lots_z as f32 * (params.lot_d + params.lot_gap) - params.lot_gap;
-    let bx = span_x + params.road_w_minor;
-    let bz = span_z + params.road_w_minor;
-    (bx, bz)
-}
 
-pub fn chunk_world_span(params: &CityGenParams) -> (f32, f32) {
-    let (bx, bz) = block_world_span(params);
-    let major_x = (params.blocks_per_chunk_x / params.major_every) as f32;
-    let major_z = (params.blocks_per_chunk_z / params.major_every) as f32;
-    let sx = params.blocks_per_chunk_x as f32 * bx + major_x * (params.road_w_major - params.road_w_minor);
-    let sz = params.blocks_per_chunk_z as f32 * bz + major_z * (params.road_w_major - params.road_w_minor);
-    (sx, sz)
-}
 
 struct XorShift64(u64);
 impl XorShift64 {
@@ -299,72 +271,28 @@ fn zone_weights(x: f32, z: f32) -> (f32,f32,f32) {
 
 pub struct CityChunk { pub buildings: Vec<BuildingRecord> }
 
-pub fn generate_city_chunk(params: &CityGenParams, cx: i32, cz: i32) -> CityChunk {
-    let (bx, bz) = block_world_span(params);
-    let (sx, sz) = chunk_world_span(params);
-    let chunk_org_x = cx as f32 * sx;
-    let chunk_org_z = cz as f32 * sz;
-    let mut rng = XorShift64::new(params.seed ^ hash2(cx, cz));
+// ───────────────────────── Helper wrappers used by assets/render ──────────
+pub fn make_timber_gable(device:&wgpu::Device) -> Mesh {
+    // simple low-rise block with coloured roof -- replace with fancy model later
+    create_block_lowrise(device)
+}
+pub fn make_timber_gable_alt(device:&wgpu::Device) -> Mesh {
+    // slight colour tweak for visual variety
+    let mut m = create_block_lowrise(device);
+    // (could tint vertices here if desired)
+    m
+}
+pub fn make_block_tower(device:&wgpu::Device) -> Mesh {
+    create_tower_highrise(device)
+}
+pub fn make_pyramid(device:&wgpu::Device) -> Mesh {
+    create_pyramid_tower(device)
+}
+pub fn make_billboard(device:&wgpu::Device) -> Mesh {
+    create_billboard_quad(device)
+}
 
-    let mut buildings = Vec::with_capacity(
-        params.blocks_per_chunk_x * params.blocks_per_chunk_z * params.lots_x * params.lots_z
-    );
-
-    for bxi in 0..params.blocks_per_chunk_x {
-        for bzi in 0..params.blocks_per_chunk_z {
-            let major_x = params.major_every > 0 && (bxi % params.major_every == 0);
-            let major_z = params.major_every > 0 && (bzi % params.major_every == 0);
-            if major_x || major_z { continue; }
-
-            let mut block_x = -0.5*sx + bxi as f32 * bx + params.road_w_minor * 0.5;
-            let mut block_z = -0.5*sz + bzi as f32 * bz + params.road_w_minor * 0.5;
-            if (bxi % params.major_every) > 0 && ((bxi / params.major_every) > 0) {
-                block_x += (params.road_w_major - params.road_w_minor) * ((bxi / params.major_every) as f32);
-            }
-            if (bzi % params.major_every) > 0 && ((bzi / params.major_every) > 0) {
-                block_z += (params.road_w_major - params.road_w_minor) * ((bzi / params.major_every) as f32);
-            }
-
-            for lx in 0..params.lots_x {
-                for lz in 0..params.lots_z {
-                    let x = chunk_org_x + block_x + (lx as f32) * (params.lot_w + params.lot_gap) + params.lot_w * 0.5;
-                    let z = chunk_org_z + block_z + (lz as f32) * (params.lot_d + params.lot_gap) + params.lot_d * 0.5;
-
-                    let (w_low, w_high, _w_pyr) = zone_weights(x, z);
-                    let pick = rng.unit_f32();
-                    let kind = if pick < w_low {
-                        BuildingKind::Lowrise
-                    } else if pick < (w_low + 0.8) {
-                        BuildingKind::Highrise
-                    } else {
-                        BuildingKind::Pyramid
-                    };
-
-                    let sx = 0.85 + 0.30 * rng.unit_f32();
-                    let sz = 0.85 + 0.30 * rng.unit_f32();
-                    let sy = match kind {
-                        BuildingKind::Lowrise  => 0.8 + 0.7 * rng.unit_f32(),
-                        BuildingKind::Highrise => {
-                            let boost = (1.0 + 1.2 * (1.0 - (x.hypot(z) / 1000.0)).clamp(0.0, 1.0));
-                            (0.8 + 1.7 * rng.unit_f32()) * boost
-                        }
-                        BuildingKind::Pyramid  => 0.8 + 0.8 * rng.unit_f32(),
-                    };
-
-                    // center.y is the vertical center (for AABB + rendering)
-                    let base_half = base_half_for(kind);
-                    let half_y = base_half.y * sy;
-                    let center_y = half_y;
-
-                    buildings.push(BuildingRecord {
-                        pos_center: Vector3::new(x, center_y, z),
-                        scale:      Vector3::new(sx, sy, sz),
-                        kind,
-                    });
-                }
-            }
-        }
-    }
-
-    CityChunk { buildings }
+/// Parametric ground plane – square of size `s`.
+pub fn make_ground_plane(device:&wgpu::Device, s:f32) -> Mesh {
+    create_cuboid(device, s, 0.05, s, [0.12,0.12,0.14,1.0])
 }

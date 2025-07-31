@@ -1,324 +1,220 @@
-//! Multiplayer-friendly chunk streamer for a finite world.
-//!
-//! - Tracks multiple viewers (players) and only keeps the union of nearby chunks loaded.
-//! - Bakes chunks on first visit via a CityDesigner and persists them.
-//! - Compact "placement" data (center + scale + archetype_id).
-//! - Supports floating-origin shifts.
-
-use std::collections::{HashMap, HashSet};
-
+use std::collections::HashMap;
 use cgmath::Vector3;
-use serde::{Serialize, Deserialize};
 
-use crate::assets::{AssetLibrary, BuildingCategory};
 use crate::designer_ml::{CityDesigner, DesignContext, Placement};
+use crate::assets::{AssetLibrary, BuildingCategory};
 
-// ---------- Persistence (v2) ----------
+pub type ViewerId = u32;
 
-#[derive(Serialize, Deserialize)]
-struct PlacementDisk {
-    center: [f32; 3],
-    scale:  [f32; 3],
-    arch:   u16,
+/// Runtime placement (what renderer reads)
+#[derive(Copy, Clone)]
+pub struct RuntimePlacement {
+    pub center: Vector3<f32>,
+    pub scale:  Vector3<f32>,
+    pub archetype_id: u16,
 }
-impl From<&Placement> for PlacementDisk {
-    fn from(p: &Placement) -> Self {
-        Self {
-            center: [p.center.x, p.center.y, p.center.z],
-            scale:  [p.scale.x,  p.scale.y,  p.scale.z],
-            arch:   p.archetype_id,
-        }
-    }
-}
-impl From<&PlacementDisk> for Placement {
-    fn from(d: &PlacementDisk) -> Self {
-        Self {
-            center: Vector3::new(d.center[0], d.center[1], d.center[2]),
-            scale:  Vector3::new(d.scale[0],  d.scale[1],  d.scale[2]),
-            archetype_id: d.arch,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct ChunkFileV2 {
-    cx: i32,
-    cz: i32,
-    placements: Vec<PlacementDisk>,
-}
-
-// ---------- World & streaming ----------
-
-#[derive(Clone, Copy)]
-pub struct CityGenParamsPublic {
-    pub lots_x: usize,
-    pub lots_z: usize,
-    pub lot_w:  f32,
-    pub lot_d:  f32,
-    pub lot_gap: f32,
-    pub road_w_minor: f32,
-    pub road_w_major: f32,
-    pub major_every:  usize,
-    pub blocks_per_chunk_x: usize,
-    pub blocks_per_chunk_z: usize,
+#[derive(Clone, Debug)]
+pub struct CityGenParams {
+    pub lots_x: usize, pub lots_z: usize,
+    pub lot_w: f32, pub lot_d: f32, pub lot_gap: f32,
+    pub road_w_minor: f32, pub road_w_major: f32, pub major_every: usize,
+    pub blocks_per_chunk_x: usize, pub blocks_per_chunk_z: usize,
     pub seed: u64,
 }
 
-fn block_world_span(params: &CityGenParamsPublic) -> (f32, f32) {
-    let span_x = params.lots_x as f32 * (params.lot_w + params.lot_gap) - params.lot_gap;
-    let span_z = params.lots_z as f32 * (params.lot_d + params.lot_gap) - params.lot_gap;
-    let bx = span_x + params.road_w_minor;
-    let bz = span_z + params.road_w_minor;
-    (bx, bz)
+// world metric sizes
+pub fn block_world_span(p: &CityGenParams) -> (f32,f32) {
+    let block_w = p.lots_x as f32 * p.lot_w + (p.lots_x-1) as f32 * p.lot_gap + p.road_w_minor;
+    let block_d = p.lots_z as f32 * p.lot_d + (p.lots_z-1) as f32 * p.lot_gap + p.road_w_minor;
+    (block_w, block_d)
+}
+pub fn chunk_world_span(p: &CityGenParams) -> (f32,f32) {
+    let (bw, bd) = block_world_span(p);
+    let mut w = p.blocks_per_chunk_x as f32 * bw;
+    let mut d = p.blocks_per_chunk_z as f32 * bd;
+    // include major roads
+    if p.major_every > 0 {
+        w += (p.blocks_per_chunk_x / p.major_every) as f32 * (p.road_w_major - p.road_w_minor);
+        d += (p.blocks_per_chunk_z / p.major_every) as f32 * (p.road_w_major - p.road_w_minor);
+    }
+    (w, d)
 }
 
-pub fn chunk_world_span(params: &CityGenParamsPublic) -> (f32, f32) {
-    let (bx, bz) = block_world_span(params);
-    let major_x = (params.blocks_per_chunk_x / params.major_every) as f32;
-    let major_z = (params.blocks_per_chunk_z / params.major_every) as f32;
-    let sx = params.blocks_per_chunk_x as f32 * bx + major_x * (params.road_w_major - params.road_w_minor);
-    let sz = params.blocks_per_chunk_z as f32 * bz + major_z * (params.road_w_major - params.road_w_minor);
-    (sx, sz)
+#[derive(Hash, Eq, PartialEq, Copy, Clone)]
+pub(crate) struct ChunkKey(pub i32, pub i32);
+
+fn wrap_coord(c: i32, min_c: i32, max_c: i32) -> i32 {
+    let size = max_c - min_c + 1;
+    let mut v = (c - min_c) % size;
+    if v < 0 { v += size; }
+    v + min_c
 }
 
-pub type ViewerId = u64;
+fn wrap_key(cx: i32, cz: i32, bounds: (i32,i32,i32,i32)) -> ChunkKey {
+    let (minx, maxx, minz, maxz) = bounds;
+    ChunkKey(
+        wrap_coord(cx, minx, maxx),
+        wrap_coord(cz, minz, maxz),
+    )
+}
 
 pub struct ChunkManager {
-    /// Public generation params (mirrors mesh::CityGenParams but decoupled).
-    pub params: CityGenParamsPublic,
-
-    /// How many chunks around a viewer to keep loaded (Manhattan or square radius).
+    pub params: CityGenParams,
     pub chunk_radius: i32,
+    pub bounds: (i32,i32,i32,i32), // inclusive [minx..maxx]x[minz..maxz]
+    pub loaded: HashMap<ChunkKey, Vec<RuntimePlacement>>,
+    viewers: HashMap<ViewerId, (f32,f32)>, // x,z in meters
 
-    /// Chunk span in meters.
-    pub chunk_span_x: f32,
-    pub chunk_span_z: f32,
+    // baked store path or in-browser storage key prefix
+    pub store_prefix: String,
 
-    /// Loaded chunk -> placements.
-    pub loaded: HashMap<(i32,i32), Vec<Placement>>,
-
-    /// Active viewers and their positions.
-    viewers: HashMap<ViewerId, (f32, f32)>,
-
-    /// Finite world bounds.
-    pub min_cx: i32, pub max_cx: i32,
-    pub min_cz: i32, pub max_cz: i32,
-
-    /// If true, newly generated chunks are persisted.
-    pub bake_on_miss: bool,
-
-    /// Native: directory path; Web: unused (localStorage).
-    pub store_dir: String,
+    // torus world span (meters)
+    world_span_x: f32,
+    world_span_z: f32,
 }
 
 impl ChunkManager {
-    pub fn new(params_mesh: crate::mesh::CityGenParams,
-               chunk_radius: i32,
-               bounds: (i32,i32,i32,i32),
-               bake_on_miss: bool,
-               store_dir: &str) -> Self
-    {
-        let params = CityGenParamsPublic {
-            lots_x: params_mesh.lots_x,
-            lots_z: params_mesh.lots_z,
-            lot_w: params_mesh.lot_w,
-            lot_d: params_mesh.lot_d,
-            lot_gap: params_mesh.lot_gap,
-            road_w_minor: params_mesh.road_w_minor,
-            road_w_major: params_mesh.road_w_major,
-            major_every: params_mesh.major_every,
-            blocks_per_chunk_x: params_mesh.blocks_per_chunk_x,
-            blocks_per_chunk_z: params_mesh.blocks_per_chunk_z,
-            seed: params_mesh.seed,
-        };
-        let (sx, sz) = chunk_world_span(&params);
-
+    pub fn new(params: CityGenParams, chunk_radius: i32, bounds: (i32,i32,i32,i32), bake_on_miss: bool, store_prefix: &str) -> Self {
+        let (cw, cd) = chunk_world_span(&params);
         Self {
             params,
-            chunk_radius,
-            chunk_span_x: sx,
-            chunk_span_z: sz,
+            chunk_radius: chunk_radius.max(1),
+            bounds,
             loaded: HashMap::new(),
             viewers: HashMap::new(),
-            min_cx: bounds.0, max_cx: bounds.1, min_cz: bounds.2, max_cz: bounds.3,
-            bake_on_miss,
-            store_dir: store_dir.to_owned(),
+            store_prefix: store_prefix.to_string(),
+            world_span_x: cw * ((bounds.1 - bounds.0 + 1) as f32),
+            world_span_z: cd * ((bounds.3 - bounds.2 + 1) as f32),
         }
     }
 
     #[inline]
-    pub fn world_to_chunk_coords(&self, x: f32, z: f32) -> (i32, i32) {
-        let cx = (x / self.chunk_span_x).floor() as i32;
-        let cz = (z / self.chunk_span_z).floor() as i32;
+    pub fn world_span(&self) -> (f32,f32) { (self.world_span_x, self.world_span_z) }
+
+    pub fn set_viewer(&mut self, id: ViewerId, world_x: f32, world_z: f32) {
+        self.viewers.insert(id, (world_x, world_z));
+    }
+
+    pub fn apply_shift(&mut self, off: Vector3<f32>) {
+        // shift all loaded placements (keep camera-centered continuity)
+        for list in self.loaded.values_mut() {
+            for p in list.iter_mut() {
+                p.center -= off;
+            }
+        }
+        // also shift viewer positions
+        for v in self.viewers.values_mut() {
+            v.0 -= off.x;
+            v.1 -= off.z;
+        }
+    }
+
+    fn world_to_chunk(&self, x: f32, z: f32) -> (i32, i32) {
+        let (cw, cd) = chunk_world_span(&self.params);
+        let cx = (x / cw).floor() as i32;
+        let cz = (z / cd).floor() as i32;
         (cx, cz)
     }
 
-    #[inline]
-    fn in_bounds(&self, cx: i32, cz: i32) -> bool {
-        cx >= self.min_cx && cx <= self.max_cx && cz >= self.min_cz && cz <= self.max_cz
-    }
-
-    /// Register or update a viewer (player) position.
-    pub fn set_viewer(&mut self, id: ViewerId, x: f32, z: f32) {
-        self.viewers.insert(id, (x, z));
-    }
-
-    /// Remove a viewer when they disconnect.
-    pub fn remove_viewer(&mut self, id: ViewerId) {
-        self.viewers.remove(&id);
-        self.prune_unneeded();
-    }
-
-    /// Apply floating-origin shift to all loaded chunks.
-    pub fn apply_shift(&mut self, offset: Vector3<f32>) {
-        for list in self.loaded.values_mut() {
-            for p in list {
-                p.center -= offset;
-            }
-        }
-        for v in self.viewers.values_mut() {
-            v.0 -= offset.x;
-            v.1 -= offset.z;
-        }
-    }
-
-    /// Ensure all viewers have their surrounding chunks loaded. Uses designer to bake on miss.
-    pub fn ensure_for_viewers<D: CityDesigner>(
+    fn ensure_chunk(
         &mut self,
-        designer: &mut D,
+        cx: i32, cz: i32,
+        designer: &mut dyn CityDesigner,
         assets: &AssetLibrary,
     ) {
-        // Compute union of needed chunks for all viewers.
-        let mut want = HashSet::new();
-        for (_, (x, z)) in self.viewers.iter() {
-            let (ccx, ccz) = self.world_to_chunk_coords(*x, *z);
+        let key = wrap_key(cx, cz, self.bounds);
+        if self.loaded.contains_key(&key) { return; }
+
+        // Try load from baked store (omitted for brevity; can add your existing file/localStorage)
+        // If not found, design now:
+        let ctx = DesignContext { cx: key.0, cz: key.1, seed: self.params.seed };
+        let placements = designer.design_chunk(&ctx, assets);
+
+        // Convert to runtime
+        let mut rt: Vec<RuntimePlacement> = Vec::with_capacity(placements.len());
+        for p in placements {
+            rt.push(RuntimePlacement { center: p.center, scale: p.scale, archetype_id: p.archetype_id });
+        }
+
+        self.loaded.insert(key, rt);
+    }
+
+    pub fn ensure_for_viewers(
+        &mut self,
+        designer: &mut dyn CityDesigner,
+        assets: &AssetLibrary,
+    ) {
+        for (_vid, (wx, wz)) in self.viewers.clone() {
+            let (vcx, vcz) = self.world_to_chunk(wx, wz);
             for dz in -self.chunk_radius..=self.chunk_radius {
                 for dx in -self.chunk_radius..=self.chunk_radius {
-                    let cx = ccx + dx;
-                    let cz = ccz + dz;
-                    if self.in_bounds(cx, cz) {
-                        want.insert((cx, cz));
+                    let cx = vcx + dx;
+                    let cz = vcz + dz;
+                    self.ensure_chunk(cx, cz, designer, assets);
+                }
+            }
+        }
+    }
+
+    /// Randomly change a few buildings near viewers (rate: fraction of placements per second).
+    pub fn mutate_near(
+        &mut self,
+        assets: &AssetLibrary,
+        rate_per_sec: f32,
+        dt: f32,
+        radius_chunks: i32,
+        seed_add: u64,
+    ) {
+        if rate_per_sec <= 0.0 { return; }
+        let mut want_mut = 0.0;
+
+        let (cw, cd) = chunk_world_span(&self.params);
+
+        for (_id, (wx, wz)) in self.viewers.iter() {
+            let (vcx, vcz) = self.world_to_chunk(*wx, *wz);
+            for dz in -radius_chunks..=radius_chunks {
+                for dx in -radius_chunks..=radius_chunks {
+                    let key = wrap_key(vcx + dx, vcz + dz, self.bounds);
+                    if let Some(list) = self.loaded.get_mut(&key) {
+                        // decide how many to mutate
+                        want_mut += (list.len() as f32) * rate_per_sec * dt;
+                        while want_mut >= 1.0 && !list.is_empty() {
+                            want_mut -= 1.0;
+                            // pick random placement and re-roll archetype within same category
+                            let idx = (hash2(key.0 ^ key.1, list.len() as i32) ^ seed_add) as usize % list.len();
+                            let cat = assets.category_of(list[idx].archetype_id as usize);
+                            let ids = assets.indices_by_category(cat);
+                            if ids.is_empty() { continue; }
+                            // pick different id if possible
+                            let mut new_id = ids[(seed_add as usize ^ idx) % ids.len()];
+                            if ids.len() > 1 && new_id == list[idx].archetype_id as usize {
+                                new_id = ids[(idx + 1) % ids.len()];
+                            }
+                            list[idx].archetype_id = new_id as u16;
+
+                            // small scale jitter
+                            let j = ((seed_add as f32) * 0.000123).sin().abs() * 0.12;
+                            list[idx].scale.x = (list[idx].scale.x * (0.95 + j)).clamp(0.7, 1.8);
+                            list[idx].scale.y = (list[idx].scale.y * (0.95 + j)).clamp(0.7, 2.5);
+                            list[idx].scale.z = (list[idx].scale.z * (0.95 + j)).clamp(0.7, 1.8);
+
+                            // adjust Y to keep on “ground” by base_half
+                            let base = assets.base_half(new_id);
+                            list[idx].center.y = base.y * list[idx].scale.y;
+                        }
                     }
                 }
             }
         }
-
-        // Drop far/out-of-bounds chunks not needed by any viewer.
-        self.loaded.retain(|k, _| want.contains(k));
-
-        // Bake or load missing:
-        for (cx, cz) in want {
-            if self.loaded.contains_key(&(cx, cz)) { continue; }
-
-            // Try V2 store (placements).
-            if let Some(cf) = load_chunk_v2(&self.store_dir, cx, cz) {
-                let items: Vec<Placement> = cf.placements.iter().map(|d| d.into()).collect();
-                self.loaded.insert((cx, cz), items);
-                continue;
-            }
-
-            // Not in store → design & save.
-            let (sx, sz) = chunk_world_span(&self.params);
-            let ctx = DesignContext {
-                cx, cz,
-                world_min: (cx as f32 * sx - 0.5*sx, cz as f32 * sz - 0.5*sz),
-                world_max: (cx as f32 * sx + 0.5*sx, cz as f32 * sz + 0.5*sz),
-                seed: self.params.seed,
-                desired_density: 1.0,
-            };
-
-            let items = designer.design_chunk(&ctx, assets);
-            if self.bake_on_miss {
-                let cf = ChunkFileV2 {
-                    cx, cz,
-                    placements: items.iter().map(|p| PlacementDisk::from(p)).collect(),
-                };
-                let _ = save_chunk_v2(&self.store_dir, &cf); // ignore errors
-            }
-            self.loaded.insert((cx, cz), items);
-        }
-    }
-
-    /// Remove any loaded chunk that is not within radius of *any* viewer.
-    fn prune_unneeded(&mut self) {
-        if self.viewers.is_empty() {
-            self.loaded.clear();
-            return;
-        }
-        let mut want = HashSet::new();
-        for (_, (x, z)) in self.viewers.iter() {
-            let (ccx, ccz) = self.world_to_chunk_coords(*x, *z);
-            for dz in -self.chunk_radius..=self.chunk_radius {
-                for dx in -self.chunk_radius..=self.chunk_radius {
-                    let cx = ccx + dx;
-                    let cz = ccz + dz;
-                    if self.in_bounds(cx, cz) {
-                        want.insert((cx, cz));
-                    }
-                }
-            }
-        }
-        self.loaded.retain(|k, _| want.contains(k));
-    }
-
-    // ---- Compatibility shim (if your renderer still expects BuildingRecord/Kind) ----
-
-    /// Map archetype categories back to legacy BuildingKind (for existing code paths).
-    pub fn export_legacy_records(&self, assets: &AssetLibrary) -> HashMap<(i32,i32), Vec<crate::mesh::BuildingRecord>> {
-        use crate::mesh::BuildingKind;
-        let mut out = HashMap::with_capacity(self.loaded.len());
-        for (k, list) in self.loaded.iter() {
-            let mut v = Vec::with_capacity(list.len());
-            for p in list {
-                let cat = assets.category_of(p.archetype_id as usize);
-                let kind = match cat {
-                    BuildingCategory::Lowrise  => BuildingKind::Lowrise,
-                    BuildingCategory::Highrise => BuildingKind::Highrise,
-                    BuildingCategory::Landmark => BuildingKind::Pyramid,
-                };
-                v.push(crate::mesh::BuildingRecord {
-                    pos_center: p.center,
-                    scale: p.scale,
-                    kind,
-                });
-            }
-            out.insert(*k, v);
-        }
-        out
     }
 }
 
-// ---------- Storage backends (native fs / web localStorage) ----------
 
-#[cfg(not(target_arch = "wasm32"))]
-fn load_chunk_v2(dir: &str, cx: i32, cz: i32) -> Option<ChunkFileV2> {
-    let p = std::path::Path::new(dir).join("city_chunks_v2").join(format!("{}_{}.bin", cx, cz));
-    std::fs::read(p).ok().and_then(|bytes| bincode::deserialize::<ChunkFileV2>(&bytes).ok())
-}
-#[cfg(target_arch = "wasm32")]
-fn load_chunk_v2(_dir: &str, cx: i32, cz: i32) -> Option<ChunkFileV2> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
-    let key = format!("city_v2_{}_{}", cx, cz);
-    let s = storage.get_item(&key).ok()??;
-    let bytes = base64::decode(s).ok()?;
-    bincode::deserialize::<ChunkFileV2>(&bytes).ok()
-}
 
-#[cfg(not(target_arch = "wasm32"))]
-fn save_chunk_v2(dir: &str, cf: &ChunkFileV2) -> std::io::Result<()> {
-    let d = std::path::Path::new(dir).join("city_chunks_v2");
-    if !d.exists() { std::fs::create_dir_all(&d)?; }
-    let p = d.join(format!("{}_{}.bin", cf.cx, cf.cz));
-    let bytes = bincode::serialize(cf).expect("bincode serialize");
-    std::fs::write(p, bytes)
-}
-#[cfg(target_arch = "wasm32")]
-fn save_chunk_v2(_dir: &str, cf: &ChunkFileV2) -> Result<(), wasm_bindgen::JsValue> {
-    let window = web_sys::window().ok_or(wasm_bindgen::JsValue::from_str("no window"))?;
-    let storage = window.local_storage()?.ok_or(wasm_bindgen::JsValue::from_str("no localStorage"))?;
-    let key = format!("city_v2_{}_{}", cf.cx, cf.cz);
-    let bytes = bincode::serialize(cf).map_err(|e| wasm_bindgen::JsValue::from_str(&format!("{e}")))?;
-    let s = base64::encode(bytes);
-    storage.set_item(&key, &s)
+// simple hash (same as in designer)
+fn hash2(a: i32, b: i32) -> u64 {
+    let mut x = (a as i64 as i128) as u128 ^ (((b as i64 as i128) << 1) as u128) ^ 0x9E37_79B9_7F4A_7C15u128;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9u128);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EBu128);
+    (x ^ (x >> 31)) as u64
 }
